@@ -5,12 +5,58 @@
 #include <time.h>
 #include <math.h>
 #include <string.h>
+#include <unistd.h>
 #include <vector>
+#include <algorithm>
 
 static double now_ms() {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
+
+class Warp_layer : public ncnn::Layer {
+public:
+    virtual int forward(const std::vector<ncnn::Mat>& bottom_blobs,
+                        std::vector<ncnn::Mat>& top_blobs,
+                        const ncnn::Option& opt) const {
+        const ncnn::Mat x = bottom_blobs[0].convert_to_fp32();
+        const ncnn::Mat flow = bottom_blobs[1].convert_to_fp32();
+        const int w = x.w, h = x.h, ch = x.c;
+        if (flow.w != w || flow.h != h || flow.c != 2) return -100;
+        ncnn::Mat& top = top_blobs[0];
+        top.create(w, h, ch, 4u, opt.blob_allocator);
+        if (top.empty()) return -100;
+        const float* f0 = flow.channel(0);
+        const float* f1 = flow.channel(1);
+        for (int c = 0; c < ch; c++) {
+            const float* xp = x.channel(c);
+            float* tp = top.channel(c);
+            for (int y = 0; y < h; y++) {
+                for (int xi = 0; xi < w; xi++) {
+                    const float sx = xi + f0[y * w + xi];
+                    const float sy = y  + f1[y * w + xi];
+                    if (sx < 0.f || sx > (float)(w - 1) ||
+                        sy < 0.f || sy > (float)(h - 1)) {
+                        tp[y * w + xi] = 0.f;
+                        continue;
+                    }
+                    const int x0 = (int)sx, y0 = (int)sy;
+                    const int x1 = std::min(x0 + 1, w - 1);
+                    const int y1 = std::min(y0 + 1, h - 1);
+                    const float ax = sx - (float)x0, ay = sy - (float)y0;
+                    tp[y * w + xi] =
+                        (1 - ax) * (1 - ay) * xp[y0 * w + x0] +
+                        ax * (1 - ay) * xp[y0 * w + x1] +
+                        (1 - ax) * ay * xp[y1 * w + x0] +
+                        ax * ay * xp[y1 * w + x1];
+                }
+            }
+        }
+        return 0;
+    }
+};
+
+static ncnn::Layer* Warp_layer_creator(void*) { return new Warp_layer; }
 
 int main(int argc, char** argv) {
     const char* param = argc > 1 ? argv[1] : "flownet.param";
@@ -18,16 +64,24 @@ int main(int argc, char** argv) {
     int W = argc > 3 ? atoi(argv[3]) : 512;
     int H = argc > 4 ? atoi(argv[4]) : 288;
     int runs = argc > 5 ? atoi(argv[5]) : 5;
-    if (ncnn::get_gpu_count() == 0) { fprintf(stderr, "ERR: no vulkan gpu\n"); return 1; }
+    if (ncnn::get_gpu_count() == 0) {
+        fprintf(stderr, "ERR: no vulkan gpu\n"); fflush(NULL); _exit(1);
+    }
     ncnn::Net net;
     net.opt.use_vulkan_compute = true;
     net.set_vulkan_device(0);
     net.opt.use_fp16_packed = true;
     net.opt.use_fp16_storage = true;
     net.opt.use_fp16_arithmetic = false;
+    net.opt.use_packing_layout = false;
     net.opt.num_threads = 4;
-    if (net.load_param(param) != 0) { fprintf(stderr, "ERR: load_param failed\n"); return 2; }
-    if (net.load_model(bin) != 0) { fprintf(stderr, "ERR: load_model failed\n"); return 2; }
+    net.register_custom_layer("rife.Warp", Warp_layer_creator);
+    if (net.load_param(param) != 0) {
+        fprintf(stderr, "ERR: load_param failed\n"); fflush(NULL); _exit(2);
+    }
+    if (net.load_model(bin) != 0) {
+        fprintf(stderr, "ERR: load_model failed\n"); fflush(NULL); _exit(2);
+    }
     ncnn::Mat a(W, H, 3), b(W, H, 3);
     for (int c = 0; c < 3; c++) {
         float* pa = a.channel(c); float* pb = b.channel(c);
@@ -53,7 +107,7 @@ int main(int argc, char** argv) {
             ex.input(ins[0], six);
         }
         if (ex.extract(net.output_indexes()[0], out) != 0) {
-            fprintf(stderr, "ERR: extract failed\n"); return 3;
+            fprintf(stderr, "ERR: extract failed\n"); fflush(NULL); _exit(3);
         }
     }
     double mn = 1e9, mx = -1e9, sum = 0;
