@@ -6,22 +6,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: ndk
+        id: ndk
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r26b
       - name: ncnn
         run: |
           wget -q https://github.com/Tencent/ncnn/releases/download/20240410/ncnn-20240410-android-vulkan.zip
-          unzip -q ncnn-20240410-android-vulkan.zip -d ncnn
+          unzip -q ncnn-20240410-android-vulkan.zip -d ncnn-x
+          mkdir -p ncnn
+          if [ -d ncnn-x/arm64-v8a ]; then cp -r ncnn-x/* ncnn/; else cp -r ncnn-x/*/ ncnn/; fi
+          ls ncnn/arm64-v8a/lib | head -10
       - name: build
         run: |
           CC=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++
           L=ncnn/arm64-v8a/lib
           $CC -O2 -std=c++11 -DNDEBUG -Incnn/arm64-v8a/include \
             vfi_mini.cpp omp_stub.c -o librife_ncnn_vulkan.so \
+            -Wl,--start-group \
             $L/libncnn.a $L/libglslang.a $L/libSPIRV.a \
             $L/libglslang-default-resource-limits.a $L/libMachineIndependent.a \
             $L/libGenericCodeGen.a $L/libOSDependent.a \
+            -Wl,--end-group \
             -lvulkan -llog -lz -landroid
       - name: collect
         run: |
