@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stdarg.h>
+#include <time.h>
 
 int32_t omp_get_max_threads(void){return 1;}
 int32_t omp_get_num_threads(void){return 1;}
