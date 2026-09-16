@@ -23,7 +23,7 @@ jobs:
           N=ncnn-20240410-android-vulkan
           L=$N/arm64-v8a/lib
           $CCC -O2 -c omp_stub.c -o omp_stub.o
-          $CC -O2 -std=c++11 -DNDEBUG -I$N/arm64-v8a/include \
+          $CC -O2 -std=c++11 -DNDEBUG -fno-rtti -fno-exceptions -I$N/arm64-v8a/include \
             vfi_mini.cpp omp_stub.o -o librife_ncnn_vulkan.so \
             -Wl,--start-group \
             $L/libncnn.a $L/libglslang.a $L/libSPIRV.a \
