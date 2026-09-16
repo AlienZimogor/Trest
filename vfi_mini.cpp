@@ -19,10 +19,12 @@ public:
     virtual int forward(const std::vector<ncnn::Mat>& bottom_blobs,
                         std::vector<ncnn::Mat>& top_blobs,
                         const ncnn::Option& opt) const {
-        const ncnn::Mat x = bottom_blobs[0].convert_to_fp32();
-        const ncnn::Mat flow = bottom_blobs[1].convert_to_fp32();
+        const ncnn::Mat& x = bottom_blobs[0];
+        const ncnn::Mat& flow = bottom_blobs[1];
         const int w = x.w, h = x.h, ch = x.c;
         if (flow.w != w || flow.h != h || flow.c != 2) return -100;
+        if (x.elemsize != 4u || flow.elemsize != 4u ||
+            x.elempack != 1 || flow.elempack != 1) return -101;
         ncnn::Mat& top = top_blobs[0];
         top.create(w, h, ch, 4u, opt.blob_allocator);
         if (top.empty()) return -100;
@@ -70,8 +72,8 @@ int main(int argc, char** argv) {
     ncnn::Net net;
     net.opt.use_vulkan_compute = true;
     net.set_vulkan_device(0);
-    net.opt.use_fp16_packed = true;
-    net.opt.use_fp16_storage = true;
+    net.opt.use_fp16_packed = false;
+    net.opt.use_fp16_storage = false;
     net.opt.use_fp16_arithmetic = false;
     net.opt.use_packing_layout = false;
     net.opt.num_threads = 4;
@@ -107,6 +109,32 @@ int main(int argc, char** argv) {
             ex.input(ins[0], six);
         }
         if (ex.extract(net.output_indexes()[0], out) != 0) {
+            fprintf(stderr, "ERR: extract failed\n"); fflush(NULL); _exit(3);
+        }
+    }
+    double mn = 1e9, mx = -1e9, sum = 0;
+    int n = out.w * out.h * out.c;
+    const float* p = out;
+    for (int i = 0; i < n; i++) { double v = p[i]; if (v < mn) mn = v; if (v > mx) mx = v; sum += v; }
+    printf("out w=%d h=%d c=%d min=%.3f max=%.3f mean=%.3f\n",
+           out.w, out.h, out.c, mn, mx, sum / n);
+    double t0 = now_ms();
+    for (int r = 0; r < runs; r++) {
+        ncnn::Extractor e2 = net.create_extractor();
+        if ((int)ins.size() >= 2) {
+            e2.input(ins[0], a); e2.input(ins[1], b);
+            if ((int)ins.size() >= 3) e2.input(ins[2], ts);
+        } else {
+            e2.input(ins[0], six);
+        }
+        ncnn::Mat o2;
+        e2.extract(net.output_indexes()[0], o2);
+    }
+    double dt = now_ms() - t0;
+    printf("time: %d runs, %.1f ms/run => %.2f fps at %dx%d (vulkan)\n",
+           runs, dt / runs, runs * 1000.0 / dt, W, H);
+    return 0;
+}        if (ex.extract(net.output_indexes()[0], out) != 0) {
             fprintf(stderr, "ERR: extract failed\n"); fflush(NULL); _exit(3);
         }
     }
