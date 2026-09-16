@@ -134,30 +134,4 @@ int main(int argc, char** argv) {
     printf("time: %d runs, %.1f ms/run => %.2f fps at %dx%d (vulkan)\n",
            runs, dt / runs, runs * 1000.0 / dt, W, H);
     return 0;
-}        if (ex.extract(net.output_indexes()[0], out) != 0) {
-            fprintf(stderr, "ERR: extract failed\n"); fflush(NULL); _exit(3);
-        }
-    }
-    double mn = 1e9, mx = -1e9, sum = 0;
-    int n = out.w * out.h * out.c;
-    const float* p = out;
-    for (int i = 0; i < n; i++) { double v = p[i]; if (v < mn) mn = v; if (v > mx) mx = v; sum += v; }
-    printf("out w=%d h=%d c=%d min=%.3f max=%.3f mean=%.3f\n",
-           out.w, out.h, out.c, mn, mx, sum / n);
-    double t0 = now_ms();
-    for (int r = 0; r < runs; r++) {
-        ncnn::Extractor e2 = net.create_extractor();
-        if ((int)ins.size() >= 2) {
-            e2.input(ins[0], a); e2.input(ins[1], b);
-            if ((int)ins.size() >= 3) e2.input(ins[2], ts);
-        } else {
-            e2.input(ins[0], six);
-        }
-        ncnn::Mat o2;
-        e2.extract(net.output_indexes()[0], o2);
-    }
-    double dt = now_ms() - t0;
-    printf("time: %d runs, %.1f ms/run => %.2f fps at %dx%d (vulkan)\n",
-           runs, dt / runs, runs * 1000.0 / dt, W, H);
-    return 0;
 }
