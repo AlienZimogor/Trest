@@ -210,117 +210,76 @@ public:
 
 static ncnn::Layer* Warp_layer_creator(void*) { return new Warp_layer; }
 
-struct FeedCtx {
-    ncnn::Net* net;
-    int c_in;
-    ncnn::Mat a, b, ts;
-    int W, H;
-    std::vector<int> ins;
-};
-
-static void feed_into(FeedCtx& fc, ncnn::Extractor& ex) {
-    if ((int)fc.ins.size() >= 2) {
-        ex.input(fc.ins[0], fc.a); ex.input(fc.ins[1], fc.b);
-        if ((int)fc.ins.size() >= 3) ex.input(fc.ins[2], fc.ts);
-    } else {
-        ncnn::Mat in(fc.W, fc.H, fc.c_in);
-        for (int c = 0; c < fc.c_in; c++) {
-            float* p = in.channel(c);
-            if (c < 3) memcpy(p, fc.a.channel(c), (size_t)fc.W * fc.H * 4);
-            else if (c < 6) memcpy(p, fc.b.channel(c - 3), (size_t)fc.W * fc.H * 4);
-            else if (c == 6) { for (int i = 0; i < fc.W * fc.H; i++) p[i] = 0.5f; }
-            else memset(p, 0, (size_t)fc.W * fc.H * 4);
-        }
-        ex.input(fc.ins[0], in);
-    }
-}
-
-static int load_cpu_net(FeedCtx& fc, const char* param, const char* bin,
-                        int W, int H) {
-    fc.W = W; fc.H = H;
-    fc.a.create(W, H, 3); fc.b.create(W, H, 3);
-    for (int c = 0; c < 3; c++) {
-        float* pa = fc.a.channel(c); float* pb = fc.b.channel(c);
-        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
-            pa[y*W+x] = fmodf((x + c * 37.0f) / 255.0f, 1.0f);
-            pb[y*W+x] = fmodf((x + y + c * 37.0f) / 255.0f, 1.0f);
-        }
-    }
-    fc.ts.create(1, 1, 1); fc.ts.channel(0)[0] = 0.5f;
-    int threads; bool fp16;
-    parse_opt(getenv("VFI_OPT"), threads, fp16);
-    fc.net = new ncnn::Net();
-    fc.net->opt.use_vulkan_compute = false;
-    fc.net->opt.use_fp16_packed = fp16;
-    fc.net->opt.use_fp16_storage = fp16;
-    fc.net->opt.use_fp16_arithmetic = false;
-    fc.net->opt.use_packing_layout = false;
-    fc.net->opt.num_threads = threads;
-    fc.net->register_custom_layer("rife.Warp", Warp_layer_creator);
-    if (fc.net->load_param(param) != 0) return 2;
-    if (fc.net->load_model(bin) != 0) return 2;
-    fc.ins = fc.net->input_indexes();
-    fc.c_in = 0;
-    if ((int)fc.ins.size() == 1) {
-        const int cands[4] = {7, 6, 11, 4};
-        for (int k = 0; k < 4; k++) {
-            pid_t pid = fork();
-            if (pid == 0) {
-                ncnn::Mat in(W, H, cands[k]);
-                for (int c = 0; c < cands[k]; c++) {
-                    float* p = in.channel(c);
-                    if (c < 3) memcpy(p, fc.a.channel(c), (size_t)W * H * 4);
-                    else if (c < 6) memcpy(p, fc.b.channel(c - 3), (size_t)W * H * 4);
-                    else if (c == 6) { for (int i = 0; i < W * H; i++) p[i] = 0.5f; }
-                    else memset(p, 0, (size_t)W * H * 4);
-                }
-                ncnn::Extractor ex = fc.net->create_extractor();
-                ex.input(fc.ins[0], in);
-                ncnn::Mat o;
-                int r = ex.extract(fc.net->output_indexes()[0], o);
-                fflush(NULL);
-                _exit(r == 0 ? 0 : 1);
-            }
-            int st = 0; waitpid(pid, &st, 0);
-            if (WIFEXITED(st) && WEXITSTATUS(st) == 0) { fc.c_in = cands[k]; break; }
-        }
-        if (fc.c_in == 0) return 3;
-        printf("single-input contract c_in=%d\n", fc.c_in);
-    }
-    return 0;
-}
-
 static int bisect(const char* param, const char* bin, int W, int H) {
-    FeedCtx fc;
-    int rc = load_cpu_net(fc, param, bin, W, H);
-    if (rc != 0) { fprintf(stderr, "ERR: load failed rc=%d\n", rc); return rc; }
-    const std::vector<ncnn::Layer*>& lrs = fc.net->layers();
-    int n = (int)lrs.size();
+    ncnn::Net skeleton;
+    skeleton.opt.use_vulkan_compute = false;
+    if (skeleton.load_param(param) != 0) {
+        fprintf(stderr, "ERR: load_param failed in bisect\n");
+        return 2;
+    }
+    const std::vector<ncnn::Layer*>& lrs = skeleton.layers();
+    const int n = (int)lrs.size();
     printf("bisect: layers=%d\n", n);
-    int last_ok = -1;
+    std::vector<std::string> types(n), names(n);
+    std::vector<int> tops(n, -1);
     for (int i = 0; i < n; i++) {
-        if (lrs[i]->tops.empty()) continue;
-        const int blob_idx = lrs[i]->tops[0];
+        types[i] = lrs[i]->type;
+        names[i] = lrs[i]->name;
+        tops[i] = lrs[i]->tops.empty() ? -1 : lrs[i]->tops[0];
+    }
+    for (int i = 0; i < n; i++) {
+        if (tops[i] < 0) continue;
         pid_t pid = fork();
         if (pid == 0) {
-            ncnn::Extractor ex = fc.net->create_extractor();
-            feed_into(fc, ex);
+            ncnn::Net net;
+            net.opt.use_vulkan_compute = true;
+            net.set_vulkan_device(0);
+            net.opt.use_fp16_packed = false;
+            net.opt.use_fp16_storage = false;
+            net.opt.use_fp16_arithmetic = false;
+            net.opt.use_packing_layout = false;
+            net.opt.num_threads = 1;
+            if (net.load_param(param) != 0) { fflush(NULL); _exit(2); }
+            if (net.load_model(bin) != 0) { fflush(NULL); _exit(2); }
+            ncnn::Mat in(W, H, 7);
+            for (int c = 0; c < 7; c++) {
+                float* p = in.channel(c);
+                if (c < 3) {
+                    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++)
+                        p[y*W+x] = fmodf((x + c * 37.0f) / 255.0f, 1.0f);
+                } else if (c < 6) {
+                    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++)
+                        p[y*W+x] = fmodf((x + y + (c - 3) * 37.0f) / 255.0f, 1.0f);
+                } else {
+                    for (int k = 0; k < W * H; k++) p[k] = 0.5f;
+                }
+            }
+            ncnn::Extractor ex = net.create_extractor();
+            ex.input(net.input_indexes()[0], in);
             ncnn::Mat o;
-            int r = ex.extract(blob_idx, o);
+            int r = ex.extract(tops[i], o);
+            if (r == 0)
+                printf("LAYEROK %d %s %s w=%d h=%d c=%d\n",
+                       i, types[i].c_str(), names[i].c_str(), o.w, o.h, o.c);
+            else
+                printf("LAYERFAIL %d %s %s rc=%d\n",
+                       i, types[i].c_str(), names[i].c_str(), r);
             fflush(NULL);
             _exit(r == 0 ? 0 : 1);
         }
         int st = 0; waitpid(pid, &st, 0);
         if (WIFSIGNALED(st)) {
-            printf("CRASH layer %d type=%s name=%s signal=%d | last_ok=%d type=%s name=%s\n",
-                   i, lrs[i]->type.c_str(), lrs[i]->name.c_str(), WTERMSIG(st),
-                   last_ok,
-                   last_ok >= 0 ? lrs[last_ok]->type.c_str() : "none",
-                   last_ok >= 0 ? lrs[last_ok]->name.c_str() : "none");
+            printf("CRASH %d %s %s signal=%d\n",
+                   i, types[i].c_str(), names[i].c_str(), WTERMSIG(st));
             fflush(NULL);
             return 3;
         }
-        if (WIFEXITED(st) && WEXITSTATUS(st) == 0) last_ok = i;
+        if (WIFEXITED(st) && WEXITSTATUS(st) != 0) {
+            printf("STOP %d %s %s childrc=%d\n",
+                   i, types[i].c_str(), names[i].c_str(), WEXITSTATUS(st));
+            fflush(NULL);
+            return 3;
+        }
     }
     printf("ALL LAYERS OK\n");
     return 0;
