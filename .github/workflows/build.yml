@@ -12,15 +12,15 @@ jobs:
           ndk-version: r26b
       - name: ncnn
         run: |
-          wget -q https://github.com/Tencent/ncnn/releases/download/20240410/ncnn-20240410-android-vulkan.zip
-          unzip -q ncnn-20240410-android-vulkan.zip
+          wget -q https://github.com/Tencent/ncnn/releases/download/20260526/ncnn-20260526-android-vulkan.zip
+          unzip -q ncnn-20260526-android-vulkan.zip
       - name: build
         run: |
           NDK="${{ steps.ndk.outputs.ndk-path }}"
           BIN=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin
           CC=$BIN/aarch64-linux-android24-clang++
           CCC=$BIN/aarch64-linux-android24-clang
-          N=ncnn-20240410-android-vulkan
+          N=ncnn-20260526-android-vulkan
           L=$N/arm64-v8a/lib
           $CCC -O2 -c omp_stub.c -o omp_stub.o
           $CC -O2 -std=c++11 -DNDEBUG -DNCNN_STDIO -fno-rtti -fno-exceptions -I$N/arm64-v8a/include \
