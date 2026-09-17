@@ -16,6 +16,8 @@ static double now_ms() {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
+static bool g_warp_gpu = true;
+
 static const char* warp_glsl = R"GLSL(
 #version 450
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -53,12 +55,12 @@ public:
     ncnn::Pipeline* pipeline;
     Warp_layer() {
         pipeline = 0;
-        support_vulkan = true;
+        support_vulkan = g_warp_gpu;
         support_fp16_storage = false;
         support_packing = false;
     }
     virtual int create_pipeline(const ncnn::Option& opt) {
-        if (!opt.use_vulkan_compute) return 0;
+        if (!opt.use_vulkan_compute || !support_vulkan) return 0;
         std::vector<uint32_t> spirv;
         int ret = ncnn::compile_spirv_module(warp_glsl, (int)strlen(warp_glsl), opt, spirv);
         if (ret != 0) {
@@ -93,10 +95,8 @@ public:
         const ncnn::VkMat& flow = bottom_blobs[1];
         const int w = x.w, h = x.h, ch = x.c;
         if (flow.c != 2 || flow.w < w || flow.h < h) {
-            fprintf(stderr, "WARP_GPU_GUARD1 w=%d h=%d ch=%d fw=%d fh=%d fc=%d fe=%d fx=%d xe=%d xx=%d\n",
-                    w, h, ch, flow.w, flow.h, flow.c,
-                    (int)flow.elemsize, flow.elempack,
-                    (int)x.elemsize, x.elempack);
+            fprintf(stderr, "WARP_GPU_GUARD1 w=%d h=%d ch=%d fw=%d fh=%d fc=%d\n",
+                    w, h, ch, flow.w, flow.h, flow.c);
             return -100;
         }
         if (x.elemsize != 4u || flow.elemsize != 4u ||
@@ -179,31 +179,26 @@ public:
 
 static ncnn::Layer* Warp_layer_creator(void*) { return new Warp_layer; }
 
-int main(int argc, char** argv) {
-    const char* param = argc > 1 ? argv[1] : "flownet.param";
-    const char* bin   = argc > 2 ? argv[2] : "flownet.bin";
-    int W = argc > 3 ? atoi(argv[3]) : 512;
-    int H = argc > 4 ? atoi(argv[4]) : 288;
-    int runs = argc > 5 ? atoi(argv[5]) : 5;
-    const char* mode = argc > 6 ? argv[6] : "gpu";
-    const bool use_gpu = (strcmp(mode, "cpu") != 0);
-    if (use_gpu && ncnn::get_gpu_count() == 0) {
-        fprintf(stderr, "ERR: no vulkan gpu\n"); fflush(NULL); _exit(1);
-    }
+static int run_net(bool warp_gpu, const char* param, const char* bin,
+                   int W, int H, int runs, const char* label) {
+    g_warp_gpu = warp_gpu;
     ncnn::Net net;
-    net.opt.use_vulkan_compute = use_gpu;
-    if (use_gpu) net.set_vulkan_device(0);
+    net.opt.use_vulkan_compute = true;
+    net.set_vulkan_device(0);
     net.opt.use_fp16_packed = false;
     net.opt.use_fp16_storage = false;
     net.opt.use_fp16_arithmetic = false;
     net.opt.use_packing_layout = false;
+    net.opt.use_image_storage = false;
     net.opt.num_threads = 4;
     net.register_custom_layer("rife.Warp", Warp_layer_creator);
     if (net.load_param(param) != 0) {
-        fprintf(stderr, "ERR: load_param failed\n"); fflush(NULL); _exit(2);
+        fprintf(stderr, "ERR: load_param failed\n"); fflush(NULL);
+        return 2;
     }
     if (net.load_model(bin) != 0) {
-        fprintf(stderr, "ERR: load_model failed\n"); fflush(NULL); _exit(2);
+        fprintf(stderr, "ERR: load_model failed\n"); fflush(NULL);
+        return 2;
     }
     ncnn::Mat a(W, H, 3), b(W, H, 3);
     for (int c = 0; c < 3; c++) {
@@ -229,16 +224,19 @@ int main(int argc, char** argv) {
         } else {
             ex.input(ins[0], six);
         }
-        if (ex.extract(net.output_indexes()[0], out) != 0) {
-            fprintf(stderr, "ERR: extract failed\n"); fflush(NULL); _exit(3);
+        int ret = ex.extract(net.output_indexes()[0], out);
+        if (ret != 0) {
+            fprintf(stderr, "EXTRACT_RET=%d (%s)\n", ret, label);
+            fflush(NULL);
+            return 3;
         }
     }
     double mn = 1e9, mx = -1e9, sum = 0;
     int n = out.w * out.h * out.c;
     const float* p = out;
     for (int i = 0; i < n; i++) { double v = p[i]; if (v < mn) mn = v; if (v > mx) mx = v; sum += v; }
-    printf("out w=%d h=%d c=%d min=%.3f max=%.3f mean=%.3f\n",
-           out.w, out.h, out.c, mn, mx, sum / n);
+    printf("out w=%d h=%d c=%d min=%.3f max=%.3f mean=%.3f (%s)\n",
+           out.w, out.h, out.c, mn, mx, sum / n, label);
     double t0 = now_ms();
     for (int r = 0; r < runs; r++) {
         ncnn::Extractor e2 = net.create_extractor();
@@ -253,6 +251,29 @@ int main(int argc, char** argv) {
     }
     double dt = now_ms() - t0;
     printf("time: %d runs, %.1f ms/run => %.2f fps at %dx%d (%s)\n",
-           runs, dt / runs, runs * 1000.0 / dt, W, H, mode);
+           runs, dt / runs, runs * 1000.0 / dt, W, H, label);
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    const char* param = argc > 1 ? argv[1] : "flownet.param";
+    const char* bin   = argc > 2 ? argv[2] : "flownet.bin";
+    int W = argc > 3 ? atoi(argv[3]) : 512;
+    int H = argc > 4 ? atoi(argv[4]) : 288;
+    int runs = argc > 5 ? atoi(argv[5]) : 5;
+    const char* mode = argc > 6 ? argv[6] : "gpu";
+    if (ncnn::get_gpu_count() == 0) {
+        fprintf(stderr, "ERR: no vulkan gpu\n"); fflush(NULL); _exit(1);
+    }
+    if (strcmp(mode, "cpufb") == 0) {
+        return run_net(false, param, bin, W, H, runs, "cpufb") == 0 ? 0 : 3;
+    }
+    int rc = run_net(true, param, bin, W, H, runs, "gpu");
+    if (rc != 0) {
+        fprintf(stderr, "GPU_PATH_FAILED rc=%d; auto cpufb control\n", rc);
+        rc = run_net(false, param, bin, W, H, runs, "cpufb-auto");
+        if (rc != 0) _exit(3);
+        _exit(4);
+    }
     return 0;
 }
