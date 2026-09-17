@@ -2,7 +2,6 @@
 #include <ncnn/gpu.h>
 #include <ncnn/command.h>
 #include <ncnn/pipeline.h>
-#include <ncnn/layer_type.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -140,12 +139,6 @@ public:
 
 static ncnn::Layer* Reshape_fix_creator(void*) { return new Reshape_fix; }
 static ncnn::Layer* GridSample_fix_creator(void*) { return new GridSample_fix; }
-
-static void register_fixes(ncnn::Net& net) {
-    net.register_custom_layer(ncnn::layer_type_index("Reshape"), Reshape_fix_creator);
-    net.register_custom_layer(ncnn::layer_type_index("GridSample"), GridSample_fix_creator);
-    net.register_custom_layer("rife.Warp", [](void*) -> ncnn::Layer* { return 0; });
-}
 
 static const char* warp_glsl = R"GLSL(
 #version 450
@@ -305,8 +298,8 @@ public:
 static ncnn::Layer* Warp_layer_creator(void*) { return new Warp_layer; }
 
 static void register_all(ncnn::Net& net) {
-    net.register_custom_layer(ncnn::layer_type_index("Reshape"), Reshape_fix_creator);
-    net.register_custom_layer(ncnn::layer_type_index("GridSample"), GridSample_fix_creator);
+    net.register_custom_layer(ncnn::layer_to_index("Reshape"), Reshape_fix_creator);
+    net.register_custom_layer(ncnn::layer_to_index("GridSample"), GridSample_fix_creator);
     net.register_custom_layer("rife.Warp", Warp_layer_creator);
 }
 
