@@ -8,6 +8,7 @@
 #include <math.h>
 #include <string.h>
 #include <unistd.h>
+#include <thread>
 #include <vector>
 #include <algorithm>
 
@@ -148,31 +149,43 @@ public:
         const float* f0 = flow.channel(0);
         const float* f1 = flow.channel(1);
         const int fstride = flow.w;
-        for (int c = 0; c < ch; c++) {
-            const float* xp = x.channel(c);
-            float* tp = top.channel(c);
-            for (int y = 0; y < h; y++) {
-                const int fy_row = (y + oy) * fstride + ox;
-                for (int xi = 0; xi < w; xi++) {
-                    const float sx = xi + f0[fy_row + xi];
-                    const float sy = y  + f1[fy_row + xi];
-                    if (sx < 0.f || sx > (float)(w - 1) ||
-                        sy < 0.f || sy > (float)(h - 1)) {
-                        tp[y * w + xi] = 0.f;
-                        continue;
+        const int nthreads = 4;
+        auto body = [&](int y0, int y1) {
+            for (int c = 0; c < ch; c++) {
+                const float* xp = x.channel(c);
+                float* tp = top.channel(c);
+                for (int y = y0; y < y1; y++) {
+                    const int fy_row = (y + oy) * fstride + ox;
+                    for (int xi = 0; xi < w; xi++) {
+                        const float sx = xi + f0[fy_row + xi];
+                        const float sy = y  + f1[fy_row + xi];
+                        if (sx < 0.f || sx > (float)(w - 1) ||
+                            sy < 0.f || sy > (float)(h - 1)) {
+                            tp[y * w + xi] = 0.f;
+                            continue;
+                        }
+                        const int x0 = (int)sx, y0i = (int)sy;
+                        const int x1 = std::min(x0 + 1, w - 1);
+                        const int y1i = std::min(y0i + 1, h - 1);
+                        const float ax = sx - (float)x0, ay = sy - (float)y0i;
+                        tp[y * w + xi] =
+                            (1 - ax) * (1 - ay) * xp[y0i * w + x0] +
+                            ax * (1 - ay) * xp[y0i * w + x1] +
+                            (1 - ax) * ay * xp[y1i * w + x0] +
+                            ax * ay * xp[y1i * w + x1];
                     }
-                    const int x0 = (int)sx, y0 = (int)sy;
-                    const int x1 = std::min(x0 + 1, w - 1);
-                    const int y1 = std::min(y0 + 1, h - 1);
-                    const float ax = sx - (float)x0, ay = sy - (float)y0;
-                    tp[y * w + xi] =
-                        (1 - ax) * (1 - ay) * xp[y0 * w + x0] +
-                        ax * (1 - ay) * xp[y0 * w + x1] +
-                        (1 - ax) * ay * xp[y1 * w + x0] +
-                        ax * ay * xp[y1 * w + x1];
                 }
             }
+        };
+        const int per = (h + nthreads - 1) / nthreads;
+        std::vector<std::thread> ths;
+        for (int t = 1; t < nthreads; t++) {
+            int y0 = t * per;
+            int y1 = std::min(h, y0 + per);
+            if (y0 < y1) ths.push_back(std::thread(body, y0, y1));
         }
+        body(0, std::min(h, per));
+        for (std::thread& th : ths) th.join();
         return 0;
     }
 };
@@ -214,15 +227,33 @@ static int run_net(bool warp_gpu, const char* param, const char* bin,
     }
     ncnn::Mat ts(1, 1, 1); ts.channel(0)[0] = 0.5f;
     const std::vector<int>& ins = net.input_indexes();
-    ncnn::Mat out;
-    {
-        ncnn::Extractor ex = net.create_extractor();
+    std::vector<ncnn::Mat> shp = net.input_shapes();
+    int c_in = ((int)shp.size() == 1 && shp[0].dims == 3) ? shp[0].c : 0;
+    printf("inputs=%d c_in=%d\n", (int)ins.size(), c_in);
+    auto feed = [&](ncnn::Extractor& ex) {
         if ((int)ins.size() >= 2) {
             ex.input(ins[0], a); ex.input(ins[1], b);
             if ((int)ins.size() >= 3) ex.input(ins[2], ts);
+        } else if (c_in >= 7) {
+            ncnn::Mat in(W, H, c_in);
+            for (int c = 0; c < c_in; c++) {
+                float* p = in.channel(c);
+                if (c < 3) memcpy(p, a.channel(c), (size_t)W * H * 4);
+                else if (c < 6) memcpy(p, b.channel(c - 3), (size_t)W * H * 4);
+                else if (c == 6) { for (int i = 0; i < W * H; i++) p[i] = 0.5f; }
+                else memset(p, 0, (size_t)W * H * 4);
+            }
+            ex.input(ins[0], in);
+        } else if (c_in == 6) {
+            ex.input(ins[0], six);
         } else {
             ex.input(ins[0], six);
         }
+    };
+    ncnn::Mat out;
+    {
+        ncnn::Extractor ex = net.create_extractor();
+        feed(ex);
         int ret = ex.extract(net.output_indexes()[0], out);
         if (ret != 0) {
             fprintf(stderr, "EXTRACT_RET=%d (%s)\n", ret, label);
@@ -239,12 +270,7 @@ static int run_net(bool warp_gpu, const char* param, const char* bin,
     double t0 = now_ms();
     for (int r = 0; r < runs; r++) {
         ncnn::Extractor e2 = net.create_extractor();
-        if ((int)ins.size() >= 2) {
-            e2.input(ins[0], a); e2.input(ins[1], b);
-            if ((int)ins.size() >= 3) e2.input(ins[2], ts);
-        } else {
-            e2.input(ins[0], six);
-        }
+        feed(e2);
         ncnn::Mat o2;
         e2.extract(net.output_indexes()[0], o2);
     }
