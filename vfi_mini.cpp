@@ -17,7 +17,7 @@ static double now_ms() {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
-static bool g_warp_gpu = true;
+static bool g_warp_gpu = false;
 
 static const char* warp_glsl = R"GLSL(
 #version 450
@@ -192,16 +192,17 @@ public:
 
 static ncnn::Layer* Warp_layer_creator(void*) { return new Warp_layer; }
 
-static int run_net(bool warp_gpu, const char* param, const char* bin,
+static int run_net(bool warp_gpu, bool use_vulkan,
+                   const char* param, const char* bin,
                    int W, int H, int runs, const char* label) {
     g_warp_gpu = warp_gpu;
     ncnn::Net net;
-    net.opt.use_vulkan_compute = true;
-    net.set_vulkan_device(0);
-    net.opt.use_fp16_packed = true;
-    net.opt.use_fp16_storage = true;
+    net.opt.use_vulkan_compute = use_vulkan;
+    if (use_vulkan) net.set_vulkan_device(0);
+    net.opt.use_fp16_packed = false;
+    net.opt.use_fp16_storage = false;
     net.opt.use_fp16_arithmetic = false;
-    net.opt.use_packing_layout = true;
+    net.opt.use_packing_layout = false;
     net.opt.num_threads = 4;
     net.register_custom_layer("rife.Warp", Warp_layer_creator);
     if (net.load_param(param) != 0) {
@@ -222,7 +223,7 @@ static int run_net(bool warp_gpu, const char* param, const char* bin,
     }
     ncnn::Mat ts(1, 1, 1); ts.channel(0)[0] = 0.5f;
     const std::vector<int>& ins = net.input_indexes();
-    printf("inputs=%d\n", (int)ins.size());
+    printf("inputs=%d vulkan=%d\n", (int)ins.size(), use_vulkan ? 1 : 0);
     auto make_input = [&](int ci) {
         ncnn::Mat in(W, H, ci);
         for (int c = 0; c < ci; c++) {
@@ -277,6 +278,9 @@ static int run_net(bool warp_gpu, const char* param, const char* bin,
     for (int i = 0; i < n; i++) { double v = p[i]; if (v < mn) mn = v; if (v > mx) mx = v; sum += v; }
     printf("out w=%d h=%d c=%d min=%.3f max=%.3f mean=%.3f (%s)\n",
            out.w, out.h, out.c, mn, mx, sum / n, label);
+    if (!(sum == sum)) {
+        fprintf(stderr, "WARN: NaN in output (%s)\n", label);
+    }
     double t0 = now_ms();
     for (int r = 0; r < runs; r++) {
         ncnn::Extractor e2 = net.create_extractor();
@@ -297,19 +301,22 @@ int main(int argc, char** argv) {
     int H = argc > 4 ? atoi(argv[4]) : 288;
     int runs = argc > 5 ? atoi(argv[5]) : 5;
     const char* mode = argc > 6 ? argv[6] : "gpu";
+    if (strcmp(mode, "cpu") == 0) {
+        return run_net(false, false, param, bin, W, H, runs, "cpu") == 0 ? 0 : 3;
+    }
+    if (strcmp(mode, "gpuw") == 0) {
+        if (ncnn::get_gpu_count() == 0) {
+            fprintf(stderr, "ERR: no vulkan gpu\n"); fflush(NULL); _exit(1);
+        }
+        int rc = run_net(true, true, param, bin, W, H, runs, "gpuw");
+        if (rc != 0) {
+            fprintf(stderr, "GPUW_FAILED rc=%d\n", rc); fflush(NULL);
+            return 3;
+        }
+        return 0;
+    }
     if (ncnn::get_gpu_count() == 0) {
         fprintf(stderr, "ERR: no vulkan gpu\n"); fflush(NULL); _exit(1);
     }
-    if (strcmp(mode, "cpufb") == 0) {
-        return run_net(false, param, bin, W, H, runs, "cpufb") == 0 ? 0 : 3;
-    }
-    int rc = run_net(true, param, bin, W, H, runs, "gpu");
-    if (rc != 0) {
-        fprintf(stderr, "GPU_PATH_FAILED rc=%d; auto cpufb control\n", rc);
-        fflush(NULL);
-        rc = run_net(false, param, bin, W, H, runs, "cpufb-auto");
-        fflush(NULL);
-        return rc != 0 ? 3 : 4;
-    }
-    return 0;
+    return run_net(false, true, param, bin, W, H, runs, "gpu") == 0 ? 0 : 3;
 }
