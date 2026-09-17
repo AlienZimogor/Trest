@@ -271,9 +271,10 @@ int main(int argc, char** argv) {
     int rc = run_net(true, param, bin, W, H, runs, "gpu");
     if (rc != 0) {
         fprintf(stderr, "GPU_PATH_FAILED rc=%d; auto cpufb control\n", rc);
+        fflush(NULL);
         rc = run_net(false, param, bin, W, H, runs, "cpufb-auto");
-        if (rc != 0) _exit(3);
-        _exit(4);
+        fflush(NULL);
+        return rc != 0 ? 3 : 4;
     }
     return 0;
 }
