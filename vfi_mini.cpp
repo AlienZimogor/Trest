@@ -22,9 +22,17 @@ public:
         const ncnn::Mat& x = bottom_blobs[0];
         const ncnn::Mat& flow = bottom_blobs[1];
         const int w = x.w, h = x.h, ch = x.c;
-        if (flow.w != w || flow.h != h || flow.c != 2) return -100;
+        if (flow.w != w || flow.h != h || flow.c != 2) {
+            fprintf(stderr, "WARP_GUARD1 w=%d h=%d ch=%d fw=%d fh=%d fc=%d\n",
+                    w, h, ch, flow.w, flow.h, flow.c);
+            return -100;
+        }
         if (x.elemsize != 4u || flow.elemsize != 4u ||
-            x.elempack != 1 || flow.elempack != 1) return -101;
+            x.elempack != 1 || flow.elempack != 1) {
+            fprintf(stderr, "WARP_GUARD2 xs=%zu xe=%d fs=%zu fe=%d\n",
+                    x.elemsize, x.elempack, flow.elemsize, flow.elempack);
+            return -101;
+        }
         ncnn::Mat& top = top_blobs[0];
         top.create(w, h, ch, 4u, opt.blob_allocator);
         if (top.empty()) return -100;
