@@ -1,6 +1,6 @@
 #include <ncnn/net.h>
 #include <ncnn/gpu.h>
-#include <ncnn/command_vulkan.h>
+#include <ncnn/command.h>
 #include <ncnn/pipeline.h>
 #include <stdio.h>
 #include <stdlib.h>
