@@ -21,8 +21,8 @@ static double now_ms() {
 
 static bool g_warp_gpu = false;
 
-static void parse_opt(const char* e, bool& p8, int& threads, bool& fp16) {
-    p8 = true; threads = 4; fp16 = false;
+static void parse_opt(const char* e, int& threads, bool& fp16) {
+    threads = 4; fp16 = false;
     if (!e) return;
     std::string s(e);
     size_t pos = 0;
@@ -30,8 +30,7 @@ static void parse_opt(const char* e, bool& p8, int& threads, bool& fp16) {
         size_t col = s.find(':', pos);
         std::string tok = s.substr(pos,
             col == std::string::npos ? std::string::npos : col - pos);
-        if (tok == "p8=0") p8 = false;
-        else if (tok == "thr=1") threads = 1;
+        if (tok == "thr=1") threads = 1;
         else if (tok == "fp16=1") fp16 = true;
         if (col == std::string::npos) break;
         pos = col + 1;
@@ -248,11 +247,10 @@ static int load_cpu_net(FeedCtx& fc, const char* param, const char* bin,
         }
     }
     fc.ts.create(1, 1, 1); fc.ts.channel(0)[0] = 0.5f;
-    bool p8; int threads; bool fp16;
-    parse_opt(getenv("VFI_OPT"), p8, threads, fp16);
+    int threads; bool fp16;
+    parse_opt(getenv("VFI_OPT"), threads, fp16);
     fc.net = new ncnn::Net();
     fc.net->opt.use_vulkan_compute = false;
-    fc.net->opt.use_shader_pack8 = p8;
     fc.net->opt.use_fp16_packed = fp16;
     fc.net->opt.use_fp16_storage = fp16;
     fc.net->opt.use_fp16_arithmetic = false;
@@ -332,13 +330,12 @@ static int run_net(bool warp_gpu, bool use_vulkan,
                    const char* param, const char* bin,
                    int W, int H, int runs, const char* label) {
     g_warp_gpu = warp_gpu;
-    bool p8; int threads; bool fp16;
-    parse_opt(getenv("VFI_OPT"), p8, threads, fp16);
-    printf("opt: p8=%d thr=%d fp16=%d\n", p8 ? 1 : 0, threads, fp16 ? 1 : 0);
+    int threads; bool fp16;
+    parse_opt(getenv("VFI_OPT"), threads, fp16);
+    printf("opt: thr=%d fp16=%d\n", threads, fp16 ? 1 : 0);
     ncnn::Net net;
     net.opt.use_vulkan_compute = use_vulkan;
     if (use_vulkan) net.set_vulkan_device(0);
-    net.opt.use_shader_pack8 = p8;
     net.opt.use_fp16_packed = fp16;
     net.opt.use_fp16_storage = fp16;
     net.opt.use_fp16_arithmetic = false;
