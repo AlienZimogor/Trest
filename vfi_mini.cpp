@@ -94,7 +94,7 @@ public:
         const int w = x.w, h = x.h, ch = x.c;
         if (flow.c != 2 || flow.w < w || flow.h < h) return -100;
         ncnn::VkMat& top = top_blobs[0];
-        top.create(w, h, ch, 4u, 1, opt.blob_allocator);
+        top.create(w, h, ch, 4u, 1, opt.blob_vkallocator);
         if (top.empty()) return -100;
         std::vector<ncnn::VkMat> bindings(3);
         bindings[0] = x;
