@@ -1,0 +1,26 @@
+name: vfi-model
+on: [workflow_dispatch]
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: pnnx
+        run: |
+          wget -q https://github.com/Tencent/ncnn/releases/download/20240410/pnnx-20240410-ubuntu.zip
+          unzip -q pnnx-20240410-ubuntu.zip -d pnnx
+          chmod +x pnnx/pnnx
+      - name: convert
+        run: |
+          ls -la
+          ./pnnx/pnnx rife_v4.26.onnx
+          echo "=== PARAM HEAD ==="
+          head -30 rife_v4.26.ncnn.param
+          echo "=== LAYER TYPES ==="
+          awk 'NR>2 {print $1}' rife_v4.26.ncnn.param | sort | uniq -c | sort -rn
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rife-ncnn
+          path: |
+            rife_v4.26.ncnn.param
+            rife_v4.26.ncnn.bin
