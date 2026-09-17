@@ -64,7 +64,15 @@ public:
         if (tw > 0 && th > 0 && total % (tw * th) == 0) tc = total / (tw * th);
         if (tc == 0) {
             tc = c11 > 0 ? c11 : (c2 > 0 ? c2 : b.c);
-            if (tw <= 0 || th <= 0 || tw * th * tc != total) return -100;
+            if (tw <= 0 || th <= 0 || tw * th * tc != total) {
+                fprintf(stderr, "RESHAPE_FAIL %s in=%dx%dx%d total=%d tw=%d th=%d c11=%d c2=%d\n",
+                        name.c_str(), b.w, b.h, b.c, total, tw, th, c11, c2);
+                return -100;
+            }
+        }
+        if (c11 > 0 && tc != c11) {
+            fprintf(stderr, "RESHAPE_DIVERGE %s in=%dx%dx%d c11=%d c2=%d got_tc=%d\n",
+                    name.c_str(), b.w, b.h, b.c, c11, c2, tc);
         }
         ncnn::Mat& top = tb[0];
         top.create(tw, th, tc, b.elemsize, b.elempack, opt.blob_allocator);
@@ -92,44 +100,54 @@ public:
                         const ncnn::Option& opt) const {
         const ncnn::Mat& x = bb[0];
         const ncnn::Mat& grid = bb[1];
-        if (grid.empty() || grid.c != 2 || grid.w != x.w || grid.h != x.h) return -100;
+        if (x.empty() || grid.empty() || grid.c != 2) {
+            fprintf(stderr, "GRIDSAMPLE_GUARD %s x=%dx%dx%d grid=%dx%dx%d xempty=%d gempty=%d\n",
+                    name.c_str(), x.w, x.h, x.c, grid.w, grid.h, grid.c,
+                    x.empty() ? 1 : 0, grid.empty() ? 1 : 0);
+            return -100;
+        }
         if (x.elemsize != 4u || grid.elemsize != 4u ||
-            x.elempack != 1 || grid.elempack != 1) return -101;
-        const int W = x.w, H = x.h, C = x.c;
+            x.elempack != 1 || grid.elempack != 1) {
+            fprintf(stderr, "GRIDSAMPLE_GUARD2 %s xs=%zu xe=%d fs=%zu fe=%d\n",
+                    name.c_str(), x.elemsize, x.elempack, grid.elemsize, grid.elempack);
+            return -101;
+        }
+        const int IW = x.w, IH = x.h, C = x.c;
+        const int GW = grid.w, GH = grid.h;
         ncnn::Mat& top = tb[0];
-        top.create(W, H, C, 4u, opt.blob_allocator);
+        top.create(GW, GH, C, 4u, opt.blob_allocator);
         if (top.empty()) return -100;
         const float* gx = grid.channel(0);
         const float* gy = grid.channel(1);
         for (int c = 0; c < C; c++) {
             const float* xp = x.channel(c);
             float* tp = top.channel(c);
-            for (int y = 0; y < H; y++) {
-                for (int xi = 0; xi < W; xi++) {
-                    const float g0 = gx[y * W + xi];
-                    const float g1 = gy[y * W + xi];
+            for (int y = 0; y < GH; y++) {
+                for (int xi = 0; xi < GW; xi++) {
+                    const float g0 = gx[y * GW + xi];
+                    const float g1 = gy[y * GW + xi];
                     float sx, sy;
                     if (align_corners) {
-                        sx = (g0 + 1.f) * (W - 1) * 0.5f;
-                        sy = (g1 + 1.f) * (H - 1) * 0.5f;
+                        sx = (g0 + 1.f) * (IW - 1) * 0.5f;
+                        sy = (g1 + 1.f) * (IH - 1) * 0.5f;
                     } else {
-                        sx = ((g0 + 1.f) * W - 1.f) * 0.5f;
-                        sy = ((g1 + 1.f) * H - 1.f) * 0.5f;
+                        sx = ((g0 + 1.f) * IW - 1.f) * 0.5f;
+                        sy = ((g1 + 1.f) * IH - 1.f) * 0.5f;
                     }
-                    if (sx < 0.f || sx > (float)(W - 1) ||
-                        sy < 0.f || sy > (float)(H - 1)) {
-                        tp[y * W + xi] = 0.f;
+                    if (sx < 0.f || sx > (float)(IW - 1) ||
+                        sy < 0.f || sy > (float)(IH - 1)) {
+                        tp[y * GW + xi] = 0.f;
                         continue;
                     }
                     const int x0 = (int)sx, y0 = (int)sy;
-                    const int x1 = std::min(x0 + 1, W - 1);
-                    const int y1 = std::min(y0 + 1, H - 1);
+                    const int x1 = std::min(x0 + 1, IW - 1);
+                    const int y1 = std::min(y0 + 1, IH - 1);
                     const float ax = sx - (float)x0, ay = sy - (float)y0;
-                    tp[y * W + xi] =
-                        (1 - ax) * (1 - ay) * xp[y0 * W + x0] +
-                        ax * (1 - ay) * xp[y0 * W + x1] +
-                        (1 - ax) * ay * xp[y1 * W + x0] +
-                        ax * ay * xp[y1 * W + x1];
+                    tp[y * GW + xi] =
+                        (1 - ax) * (1 - ay) * xp[y0 * IW + x0] +
+                        ax * (1 - ay) * xp[y0 * IW + x1] +
+                        (1 - ax) * ay * xp[y1 * IW + x0] +
+                        ax * ay * xp[y1 * IW + x1];
                 }
             }
         }
