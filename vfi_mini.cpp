@@ -22,7 +22,7 @@ public:
         const ncnn::Mat& x = bottom_blobs[0];
         const ncnn::Mat& flow = bottom_blobs[1];
         const int w = x.w, h = x.h, ch = x.c;
-        if (flow.w != w || flow.h != h || flow.c != 2) {
+        if (flow.c != 2 || flow.w < w || flow.h < h) {
             fprintf(stderr, "WARP_GUARD1 w=%d h=%d ch=%d fw=%d fh=%d fc=%d\n",
                     w, h, ch, flow.w, flow.h, flow.c);
             return -100;
@@ -33,18 +33,22 @@ public:
                     x.elemsize, x.elempack, flow.elemsize, flow.elempack);
             return -101;
         }
+        const int oy = (flow.h - h) / 2;
+        const int ox = (flow.w - w) / 2;
         ncnn::Mat& top = top_blobs[0];
         top.create(w, h, ch, 4u, opt.blob_allocator);
         if (top.empty()) return -100;
         const float* f0 = flow.channel(0);
         const float* f1 = flow.channel(1);
+        const int fstride = flow.w;
         for (int c = 0; c < ch; c++) {
             const float* xp = x.channel(c);
             float* tp = top.channel(c);
             for (int y = 0; y < h; y++) {
+                const int fy_row = (y + oy) * fstride + ox;
                 for (int xi = 0; xi < w; xi++) {
-                    const float sx = xi + f0[y * w + xi];
-                    const float sy = y  + f1[y * w + xi];
+                    const float sx = xi + f0[fy_row + xi];
+                    const float sy = y  + f1[fy_row + xi];
                     if (sx < 0.f || sx > (float)(w - 1) ||
                         sy < 0.f || sy > (float)(h - 1)) {
                         tp[y * w + xi] = 0.f;
