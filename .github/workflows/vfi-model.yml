@@ -27,23 +27,33 @@ jobs:
           fi
           chmod +x pnnxdir/pnnx
           ls -la pnnxdir
-          ./pnnxdir/pnnx -version || true
       - name: convert
         run: |
           if [ ! -f rife_v4.26.onnx ]; then
-            echo "ONNX NOT IN REPO: загрузите rife_v4.26.onnx в корень репозитория"
+            echo "ONNX NOT IN REPO: загрузите rife_v4.26.onnx в корень"
             ls -la
             exit 1
           fi
-          ls -la
-          ./pnnxdir/pnnx rife_v4.26.onnx
+          python -m pip install -q onnx onnxsim numpy || true
+          echo "=== ATTEMPT 1: pnnx static 1,7,288,512 ==="
+          ./pnnxdir/pnnx rife_v4.26.onnx inputshape=[1,7,288,512] || true
+          if [ ! -f rife_v4.26.ncnn.param ]; then
+            echo "=== ATTEMPT 2: onnxsim + pnnx ==="
+            python -m onnxsim rife_v4.26.onnx rife_sim.onnx --input-shape 1,7,288,512 || true
+            ./pnnxdir/pnnx rife_sim.onnx || true
+          fi
+          if [ ! -f rife_v4.26.ncnn.param ] && [ ! -f rife_sim.ncnn.param ]; then
+            echo "BOTH ATTEMPTS FAILED"
+            exit 1
+          fi
+          P=rife_v4.26.ncnn.param
+          [ -f "$P" ] || P=rife_sim.ncnn.param
           echo "=== PARAM HEAD ==="
-          head -30 rife_v4.26.ncnn.param
+          head -30 "$P"
           echo "=== LAYER TYPES ==="
-          awk 'NR>2 {print $1}' rife_v4.26.ncnn.param | sort | uniq -c | sort -rn
+          awk 'NR>2 {print $1}' "$P" | sort | uniq -c | sort -rn
       - uses: actions/upload-artifact@v4
         with:
           name: rife-ncnn
-          path: |
-            rife_v4.26.ncnn.param
-            rife_v4.26.ncnn.bin
+          path: rife_*.ncnn.*
+          if-no-files-found: warn
