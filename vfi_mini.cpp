@@ -185,11 +185,10 @@ static int run_net(bool warp_gpu, const char* param, const char* bin,
     ncnn::Net net;
     net.opt.use_vulkan_compute = true;
     net.set_vulkan_device(0);
-    net.opt.use_fp16_packed = false;
-    net.opt.use_fp16_storage = false;
+    net.opt.use_fp16_packed = true;
+    net.opt.use_fp16_storage = true;
     net.opt.use_fp16_arithmetic = false;
-    net.opt.use_packing_layout = false;
-    net.opt.use_image_storage = false;
+    net.opt.use_packing_layout = true;
     net.opt.num_threads = 4;
     net.register_custom_layer("rife.Warp", Warp_layer_creator);
     if (net.load_param(param) != 0) {
