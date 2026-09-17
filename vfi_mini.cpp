@@ -92,7 +92,19 @@ public:
         const ncnn::VkMat& x = bottom_blobs[0];
         const ncnn::VkMat& flow = bottom_blobs[1];
         const int w = x.w, h = x.h, ch = x.c;
-        if (flow.c != 2 || flow.w < w || flow.h < h) return -100;
+        if (flow.c != 2 || flow.w < w || flow.h < h) {
+            fprintf(stderr, "WARP_GPU_GUARD1 w=%d h=%d ch=%d fw=%d fh=%d fc=%d fe=%d fx=%d xe=%d xx=%d\n",
+                    w, h, ch, flow.w, flow.h, flow.c,
+                    (int)flow.elemsize, flow.elempack,
+                    (int)x.elemsize, x.elempack);
+            return -100;
+        }
+        if (x.elemsize != 4u || flow.elemsize != 4u ||
+            x.elempack != 1 || flow.elempack != 1) {
+            fprintf(stderr, "WARP_GPU_GUARD2 xs=%zu xe=%d fs=%zu fe=%d\n",
+                    x.elemsize, x.elempack, flow.elemsize, flow.elempack);
+            return -101;
+        }
         ncnn::VkMat& top = top_blobs[0];
         top.create(w, h, ch, 4u, 1, opt.blob_vkallocator);
         if (top.empty()) return -100;
@@ -181,10 +193,10 @@ int main(int argc, char** argv) {
     ncnn::Net net;
     net.opt.use_vulkan_compute = use_gpu;
     if (use_gpu) net.set_vulkan_device(0);
-    net.opt.use_fp16_packed = true;
-    net.opt.use_fp16_storage = true;
+    net.opt.use_fp16_packed = false;
+    net.opt.use_fp16_storage = false;
     net.opt.use_fp16_arithmetic = false;
-    net.opt.use_packing_layout = true;
+    net.opt.use_packing_layout = false;
     net.opt.num_threads = 4;
     net.register_custom_layer("rife.Warp", Warp_layer_creator);
     if (net.load_param(param) != 0) {
