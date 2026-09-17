@@ -78,12 +78,14 @@ int main(int argc, char** argv) {
     int W = argc > 3 ? atoi(argv[3]) : 512;
     int H = argc > 4 ? atoi(argv[4]) : 288;
     int runs = argc > 5 ? atoi(argv[5]) : 5;
-    if (ncnn::get_gpu_count() == 0) {
+    const char* mode = argc > 6 ? argv[6] : "gpu";
+    const bool use_gpu = (strcmp(mode, "cpu") != 0);
+    if (use_gpu && ncnn::get_gpu_count() == 0) {
         fprintf(stderr, "ERR: no vulkan gpu\n"); fflush(NULL); _exit(1);
     }
     ncnn::Net net;
-    net.opt.use_vulkan_compute = true;
-    net.set_vulkan_device(0);
+    net.opt.use_vulkan_compute = use_gpu;
+    if (use_gpu) net.set_vulkan_device(0);
     net.opt.use_fp16_packed = false;
     net.opt.use_fp16_storage = false;
     net.opt.use_fp16_arithmetic = false;
@@ -143,7 +145,7 @@ int main(int argc, char** argv) {
         e2.extract(net.output_indexes()[0], o2);
     }
     double dt = now_ms() - t0;
-    printf("time: %d runs, %.1f ms/run => %.2f fps at %dx%d (vulkan)\n",
-           runs, dt / runs, runs * 1000.0 / dt, W, H);
+    printf("time: %d runs, %.1f ms/run => %.2f fps at %dx%d (%s)\n",
+           runs, dt / runs, runs * 1000.0 / dt, W, H, mode);
     return 0;
 }
