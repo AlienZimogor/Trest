@@ -1,5 +1,7 @@
 #include <ncnn/net.h>
 #include <ncnn/gpu.h>
+#include <ncnn/command_vulkan.h>
+#include <ncnn/pipeline.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -14,23 +16,106 @@ static double now_ms() {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
-static bool g_identity = false;
+static const char* warp_glsl = R"GLSL(
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(binding = 0) buffer b0 { float x[]; };
+layout(binding = 1) buffer b1 { float flow[]; };
+layout(binding = 2) buffer b2 { float top[]; };
+layout(push_constant) uniform PC {
+    int w; int h; int fw; int fh; int ox; int oy; int ch;
+} p;
+void main() {
+    int xi = int(gl_GlobalInvocationID.x);
+    int y  = int(gl_GlobalInvocationID.y);
+    int c  = int(gl_GlobalInvocationID.z);
+    if (xi >= p.w || y >= p.h || c >= p.ch) return;
+    int fidx = ((y + p.oy) * p.fw + (xi + p.ox)) * 2;
+    float sx = float(xi) + flow[fidx];
+    float sy = float(y)  + flow[fidx + 1];
+    float v = 0.0;
+    if (sx >= 0.0 && sy >= 0.0 && sx <= float(p.w - 1) && sy <= float(p.h - 1)) {
+        int x0 = int(sx); int y0 = int(sy);
+        int x1 = min(x0 + 1, p.w - 1); int y1 = min(y0 + 1, p.h - 1);
+        float ax = sx - float(x0); float ay = sy - float(y0);
+        int base = c * p.w * p.h;
+        v = (1.0 - ax) * (1.0 - ay) * x[base + y0 * p.w + x0]
+          + ax * (1.0 - ay) * x[base + y0 * p.w + x1]
+          + (1.0 - ax) * ay * x[base + y1 * p.w + x0]
+          + ax * ay * x[base + y1 * p.w + x1];
+    }
+    top[c * p.w * p.h + y * p.w + xi] = v;
+}
+)GLSL";
 
 class Warp_layer : public ncnn::Layer {
 public:
+    ncnn::Pipeline* pipeline;
+    Warp_layer() {
+        pipeline = 0;
+        support_vulkan = true;
+        support_fp16_storage = false;
+        support_packing = false;
+    }
+    virtual int create_pipeline(const ncnn::Option& opt) {
+        if (!opt.use_vulkan_compute) return 0;
+        std::vector<uint32_t> spirv;
+        int ret = ncnn::compile_spirv_module(warp_glsl, (int)strlen(warp_glsl), opt, spirv);
+        if (ret != 0) {
+            fprintf(stderr, "WARP_VULKAN_OFF compile=%d\n", ret);
+            support_vulkan = false;
+            return 0;
+        }
+        pipeline = new ncnn::Pipeline(vulkan_device());
+        pipeline->set_optimal_local_size_xyz(8, 8, 1);
+        ret = pipeline->create(spirv.data(), spirv.size() * 4, opt);
+        if (ret != 0) {
+            fprintf(stderr, "WARP_VULKAN_OFF create=%d\n", ret);
+            support_vulkan = false;
+            delete pipeline;
+            pipeline = 0;
+            return 0;
+        }
+        fprintf(stderr, "WARP_VULKAN_ON\n");
+        return 0;
+    }
+    virtual int destroy_pipeline(const ncnn::Option& opt) {
+        delete pipeline;
+        pipeline = 0;
+        return 0;
+    }
+    virtual int forward_gpu(const std::vector<ncnn::VkMat>& bottom_blobs,
+                            std::vector<ncnn::VkMat>& top_blobs,
+                            ncnn::VkCompute& cmd,
+                            const ncnn::Option& opt) const {
+        const ncnn::VkMat& x = bottom_blobs[0];
+        const ncnn::VkMat& flow = bottom_blobs[1];
+        const int w = x.w, h = x.h, ch = x.c;
+        if (flow.c != 2 || flow.w < w || flow.h < h) return -100;
+        ncnn::VkMat& top = top_blobs[0];
+        top.create(w, h, ch, 4u, 1, opt.blob_allocator, opt.workspace_allocator);
+        if (top.empty()) return -100;
+        std::vector<ncnn::VkMat> bindings(3);
+        bindings[0] = x;
+        bindings[1] = flow;
+        bindings[2] = top;
+        std::vector<ncnn::vk_constant_type> k(7);
+        k[0].i = w;
+        k[1].i = h;
+        k[2].i = flow.w;
+        k[3].i = flow.h;
+        k[4].i = (flow.w - w) / 2;
+        k[5].i = (flow.h - h) / 2;
+        k[6].i = ch;
+        cmd.record_pipeline(pipeline, bindings, k, top);
+        return 0;
+    }
     virtual int forward(const std::vector<ncnn::Mat>& bottom_blobs,
                         std::vector<ncnn::Mat>& top_blobs,
                         const ncnn::Option& opt) const {
         const ncnn::Mat& x = bottom_blobs[0];
-        const int w = x.w, h = x.h, ch = x.c;
-        if (g_identity) {
-            ncnn::Mat& top = top_blobs[0];
-            top.create(w, h, ch, 4u, opt.blob_allocator);
-            if (top.empty()) return -100;
-            memcpy(top.data, x.data, (size_t)w * h * ch * 4u);
-            return 0;
-        }
         const ncnn::Mat& flow = bottom_blobs[1];
+        const int w = x.w, h = x.h, ch = x.c;
         if (flow.c != 2 || flow.w < w || flow.h < h) {
             fprintf(stderr, "WARP_GUARD1 w=%d h=%d ch=%d fw=%d fh=%d fc=%d\n",
                     w, h, ch, flow.w, flow.h, flow.c);
@@ -88,7 +173,6 @@ int main(int argc, char** argv) {
     int H = argc > 4 ? atoi(argv[4]) : 288;
     int runs = argc > 5 ? atoi(argv[5]) : 5;
     const char* mode = argc > 6 ? argv[6] : "gpu";
-    g_identity = (strcmp(mode, "gpuid") == 0);
     const bool use_gpu = (strcmp(mode, "cpu") != 0);
     if (use_gpu && ncnn::get_gpu_count() == 0) {
         fprintf(stderr, "ERR: no vulkan gpu\n"); fflush(NULL); _exit(1);
