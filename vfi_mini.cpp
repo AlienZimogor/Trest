@@ -66,9 +66,10 @@ public:
             support_vulkan = false;
             return 0;
         }
-        pipeline = new ncnn::Pipeline(vulkan_device());
+        pipeline = new ncnn::Pipeline(vkdev);
         pipeline->set_optimal_local_size_xyz(8, 8, 1);
-        ret = pipeline->create(spirv.data(), spirv.size() * 4, opt);
+        ret = pipeline->create(spirv.data(), spirv.size() * 4,
+            std::vector<ncnn::vk_specialization_type>());
         if (ret != 0) {
             fprintf(stderr, "WARP_VULKAN_OFF create=%d\n", ret);
             support_vulkan = false;
@@ -92,8 +93,7 @@ public:
         const ncnn::VkMat& flow = bottom_blobs[1];
         const int w = x.w, h = x.h, ch = x.c;
         if (flow.c != 2 || flow.w < w || flow.h < h) return -100;
-        ncnn::VkMat& top = top_blobs[0];
-        top.create(w, h, ch, 4u, 1, opt.blob_allocator, opt.workspace_allocator);
+        ncnn::VkMat& top = top_blobs[0];top.create(w, h, ch, 4u, 1, opt.blob_allocator);
         if (top.empty()) return -100;
         std::vector<ncnn::VkMat> bindings(3);
         bindings[0] = x;
