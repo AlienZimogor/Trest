@@ -8,6 +8,7 @@
 #include <math.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/wait.h>
 #include <thread>
 #include <string>
 #include <vector>
@@ -210,6 +211,119 @@ public:
 
 static ncnn::Layer* Warp_layer_creator(void*) { return new Warp_layer; }
 
+struct FeedCtx {
+    ncnn::Net* net;
+    int c_in;
+    ncnn::Mat a, b, ts;
+    int W, H;
+    std::vector<int> ins;
+};
+
+static void feed_into(FeedCtx& fc, ncnn::Extractor& ex) {
+    if ((int)fc.ins.size() >= 2) {
+        ex.input(fc.ins[0], fc.a); ex.input(fc.ins[1], fc.b);
+        if ((int)fc.ins.size() >= 3) ex.input(fc.ins[2], fc.ts);
+    } else {
+        ncnn::Mat in(fc.W, fc.H, fc.c_in);
+        for (int c = 0; c < fc.c_in; c++) {
+            float* p = in.channel(c);
+            if (c < 3) memcpy(p, fc.a.channel(c), (size_t)fc.W * fc.H * 4);
+            else if (c < 6) memcpy(p, fc.b.channel(c - 3), (size_t)fc.W * fc.H * 4);
+            else if (c == 6) { for (int i = 0; i < fc.W * fc.H; i++) p[i] = 0.5f; }
+            else memset(p, 0, (size_t)fc.W * fc.H * 4);
+        }
+        ex.input(fc.ins[0], in);
+    }
+}
+
+static int load_cpu_net(FeedCtx& fc, const char* param, const char* bin,
+                        int W, int H) {
+    fc.W = W; fc.H = H;
+    fc.a.create(W, H, 3); fc.b.create(W, H, 3);
+    for (int c = 0; c < 3; c++) {
+        float* pa = fc.a.channel(c); float* pb = fc.b.channel(c);
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+            pa[y*W+x] = fmodf((x + c * 37.0f) / 255.0f, 1.0f);
+            pb[y*W+x] = fmodf((x + y + c * 37.0f) / 255.0f, 1.0f);
+        }
+    }
+    fc.ts.create(1, 1, 1); fc.ts.channel(0)[0] = 0.5f;
+    bool p8; int threads; bool fp16;
+    parse_opt(getenv("VFI_OPT"), p8, threads, fp16);
+    fc.net = new ncnn::Net();
+    fc.net->opt.use_vulkan_compute = false;
+    fc.net->opt.use_shader_pack8 = p8;
+    fc.net->opt.use_fp16_packed = fp16;
+    fc.net->opt.use_fp16_storage = fp16;
+    fc.net->opt.use_fp16_arithmetic = false;
+    fc.net->opt.use_packing_layout = false;
+    fc.net->opt.num_threads = threads;
+    fc.net->register_custom_layer("rife.Warp", Warp_layer_creator);
+    if (fc.net->load_param(param) != 0) return 2;
+    if (fc.net->load_model(bin) != 0) return 2;
+    fc.ins = fc.net->input_indexes();
+    fc.c_in = 0;
+    if ((int)fc.ins.size() == 1) {
+        const int cands[4] = {7, 6, 11, 4};
+        for (int k = 0; k < 4; k++) {
+            pid_t pid = fork();
+            if (pid == 0) {
+                ncnn::Mat in(W, H, cands[k]);
+                for (int c = 0; c < cands[k]; c++) {
+                    float* p = in.channel(c);
+                    if (c < 3) memcpy(p, fc.a.channel(c), (size_t)W * H * 4);
+                    else if (c < 6) memcpy(p, fc.b.channel(c - 3), (size_t)W * H * 4);
+                    else if (c == 6) { for (int i = 0; i < W * H; i++) p[i] = 0.5f; }
+                    else memset(p, 0, (size_t)W * H * 4);
+                }
+                ncnn::Extractor ex = fc.net->create_extractor();
+                ex.input(fc.ins[0], in);
+                ncnn::Mat o;
+                int r = ex.extract(fc.net->output_indexes()[0], o);
+                fflush(NULL);
+                _exit(r == 0 ? 0 : 1);
+            }
+            int st = 0; waitpid(pid, &st, 0);
+            if (WIFEXITED(st) && WEXITSTATUS(st) == 0) { fc.c_in = cands[k]; break; }
+        }
+        if (fc.c_in == 0) return 3;
+        printf("single-input contract c_in=%d\n", fc.c_in);
+    }
+    return 0;
+}
+
+static int bisect(const char* param, const char* bin, int W, int H) {
+    FeedCtx fc;
+    int rc = load_cpu_net(fc, param, bin, W, H);
+    if (rc != 0) { fprintf(stderr, "ERR: load failed rc=%d\n", rc); return rc; }
+    const std::vector<const char*> names = fc.net->blob_names();
+    int n = (int)names.size();
+    printf("bisect: blobs=%d\n", n);
+    int last_ok = -1;
+    for (int i = 0; i < n; i++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            ncnn::Extractor ex = fc.net->create_extractor();
+            feed_into(fc, ex);
+            ncnn::Mat o;
+            int r = ex.extract(i, o);
+            fflush(NULL);
+            _exit(r == 0 ? 0 : 1);
+        }
+        int st = 0; waitpid(pid, &st, 0);
+        if (WIFSIGNALED(st)) {
+            printf("CRASH blob %d name=%s signal=%d last_ok=%d name=%s\n",
+                   i, names[i], WTERMSIG(st), last_ok,
+                   last_ok >= 0 ? names[last_ok] : "none");
+            fflush(NULL);
+            return 3;
+        }
+        if (WIFEXITED(st) && WEXITSTATUS(st) == 0) last_ok = i;
+    }
+    printf("ALL BLOBS OK\n");
+    return 0;
+}
+
 static int run_net(bool warp_gpu, bool use_vulkan,
                    const char* param, const char* bin,
                    int W, int H, int runs, const char* label) {
@@ -261,13 +375,17 @@ static int run_net(bool warp_gpu, bool use_vulkan,
     if ((int)ins.size() == 1) {
         const int cands[4] = {7, 6, 11, 4};
         for (int k = 0; k < 4; k++) {
-            ncnn::Extractor ex = net.create_extractor();
-            ex.input(ins[0], make_input(cands[k]));
-            ncnn::Mat o;
-            if (ex.extract(net.output_indexes()[0], o) == 0) {
-                c_in = cands[k];
-                break;
+            pid_t pid = fork();
+            if (pid == 0) {
+                ncnn::Extractor ex = net.create_extractor();
+                ex.input(ins[0], make_input(cands[k]));
+                ncnn::Mat o;
+                int r = ex.extract(net.output_indexes()[0], o);
+                fflush(NULL);
+                _exit(r == 0 ? 0 : 1);
             }
+            int st = 0; waitpid(pid, &st, 0);
+            if (WIFEXITED(st) && WEXITSTATUS(st) == 0) { c_in = cands[k]; break; }
         }
         if (c_in == 0) {
             fprintf(stderr, "ERR: no feed contract worked\n"); fflush(NULL);
@@ -323,6 +441,9 @@ int main(int argc, char** argv) {
     int H = argc > 4 ? atoi(argv[4]) : 288;
     int runs = argc > 5 ? atoi(argv[5]) : 5;
     const char* mode = argc > 6 ? argv[6] : "gpu";
+    if (strcmp(mode, "bisect") == 0) {
+        return bisect(param, bin, W, H);
+    }
     if (strcmp(mode, "cpu") == 0) {
         return run_net(false, false, param, bin, W, H, runs, "cpu") == 0 ? 0 : 3;
     }
