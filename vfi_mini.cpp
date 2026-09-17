@@ -14,14 +14,23 @@ static double now_ms() {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
+static bool g_identity = false;
+
 class Warp_layer : public ncnn::Layer {
 public:
     virtual int forward(const std::vector<ncnn::Mat>& bottom_blobs,
                         std::vector<ncnn::Mat>& top_blobs,
                         const ncnn::Option& opt) const {
         const ncnn::Mat& x = bottom_blobs[0];
-        const ncnn::Mat& flow = bottom_blobs[1];
         const int w = x.w, h = x.h, ch = x.c;
+        if (g_identity) {
+            ncnn::Mat& top = top_blobs[0];
+            top.create(w, h, ch, 4u, opt.blob_allocator);
+            if (top.empty()) return -100;
+            memcpy(top.data, x.data, (size_t)w * h * ch * 4u);
+            return 0;
+        }
+        const ncnn::Mat& flow = bottom_blobs[1];
         if (flow.c != 2 || flow.w < w || flow.h < h) {
             fprintf(stderr, "WARP_GUARD1 w=%d h=%d ch=%d fw=%d fh=%d fc=%d\n",
                     w, h, ch, flow.w, flow.h, flow.c);
@@ -79,6 +88,7 @@ int main(int argc, char** argv) {
     int H = argc > 4 ? atoi(argv[4]) : 288;
     int runs = argc > 5 ? atoi(argv[5]) : 5;
     const char* mode = argc > 6 ? argv[6] : "gpu";
+    g_identity = (strcmp(mode, "gpuid") == 0);
     const bool use_gpu = (strcmp(mode, "cpu") != 0);
     if (use_gpu && ncnn::get_gpu_count() == 0) {
         fprintf(stderr, "ERR: no vulkan gpu\n"); fflush(NULL); _exit(1);
