@@ -5,15 +5,38 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - name: pnnx
         run: |
-          wget -q https://github.com/Tencent/ncnn/releases/download/20240410/pnnx-20240410-ubuntu.zip
-          unzip -q pnnx-20240410-ubuntu.zip -d pnnx
-          chmod +x pnnx/pnnx
+          set -x
+          mkdir -p pnnxdir
+          for u in \
+            "https://github.com/Tencent/ncnn/releases/download/20260526/pnnx-20260526-ubuntu.zip" \
+            "https://github.com/Tencent/ncnn/releases/download/20241128/pnnx-20241128-ubuntu.zip" ; do
+            if wget -q "$u"; then
+              unzip -q "$(basename "$u")" -d pnnxdir
+              break
+            fi
+          done
+          if [ ! -f pnnxdir/pnnx ]; then
+            python -m pip install -q pnnx
+            cp "$(command -v pnnx)" pnnxdir/pnnx
+          fi
+          chmod +x pnnxdir/pnnx
+          ls -la pnnxdir
+          ./pnnxdir/pnnx -version || true
       - name: convert
         run: |
+          if [ ! -f rife_v4.26.onnx ]; then
+            echo "ONNX NOT IN REPO: загрузите rife_v4.26.onnx в корень репозитория"
+            ls -la
+            exit 1
+          fi
           ls -la
-          ./pnnx/pnnx rife_v4.26.onnx
+          ./pnnxdir/pnnx rife_v4.26.onnx
           echo "=== PARAM HEAD ==="
           head -30 rife_v4.26.ncnn.param
           echo "=== LAYER TYPES ==="
