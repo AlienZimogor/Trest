@@ -9,6 +9,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <thread>
+#include <string>
 #include <vector>
 #include <algorithm>
 
@@ -18,6 +19,23 @@ static double now_ms() {
 }
 
 static bool g_warp_gpu = false;
+
+static void parse_opt(const char* e, bool& p8, int& threads, bool& fp16) {
+    p8 = true; threads = 4; fp16 = false;
+    if (!e) return;
+    std::string s(e);
+    size_t pos = 0;
+    while (pos <= s.size()) {
+        size_t col = s.find(':', pos);
+        std::string tok = s.substr(pos,
+            col == std::string::npos ? std::string::npos : col - pos);
+        if (tok == "p8=0") p8 = false;
+        else if (tok == "thr=1") threads = 1;
+        else if (tok == "fp16=1") fp16 = true;
+        if (col == std::string::npos) break;
+        pos = col + 1;
+    }
+}
 
 static const char* warp_glsl = R"GLSL(
 #version 450
@@ -196,14 +214,18 @@ static int run_net(bool warp_gpu, bool use_vulkan,
                    const char* param, const char* bin,
                    int W, int H, int runs, const char* label) {
     g_warp_gpu = warp_gpu;
+    bool p8; int threads; bool fp16;
+    parse_opt(getenv("VFI_OPT"), p8, threads, fp16);
+    printf("opt: p8=%d thr=%d fp16=%d\n", p8 ? 1 : 0, threads, fp16 ? 1 : 0);
     ncnn::Net net;
     net.opt.use_vulkan_compute = use_vulkan;
     if (use_vulkan) net.set_vulkan_device(0);
-    net.opt.use_fp16_packed = false;
-    net.opt.use_fp16_storage = false;
+    net.opt.use_shader_pack8 = p8;
+    net.opt.use_fp16_packed = fp16;
+    net.opt.use_fp16_storage = fp16;
     net.opt.use_fp16_arithmetic = false;
     net.opt.use_packing_layout = false;
-    net.opt.num_threads = 4;
+    net.opt.num_threads = threads;
     net.register_custom_layer("rife.Warp", Warp_layer_creator);
     if (net.load_param(param) != 0) {
         fprintf(stderr, "ERR: load_param failed\n"); fflush(NULL);
