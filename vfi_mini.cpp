@@ -296,31 +296,35 @@ static int bisect(const char* param, const char* bin, int W, int H) {
     FeedCtx fc;
     int rc = load_cpu_net(fc, param, bin, W, H);
     if (rc != 0) { fprintf(stderr, "ERR: load failed rc=%d\n", rc); return rc; }
-    const std::vector<const char*> names = fc.net->blob_names();
-    int n = (int)names.size();
-    printf("bisect: blobs=%d\n", n);
+    const std::vector<ncnn::Layer*>& lrs = fc.net->layers();
+    int n = (int)lrs.size();
+    printf("bisect: layers=%d\n", n);
     int last_ok = -1;
     for (int i = 0; i < n; i++) {
+        if (lrs[i]->tops.empty()) continue;
+        const int blob_idx = lrs[i]->tops[0];
         pid_t pid = fork();
         if (pid == 0) {
             ncnn::Extractor ex = fc.net->create_extractor();
             feed_into(fc, ex);
             ncnn::Mat o;
-            int r = ex.extract(i, o);
+            int r = ex.extract(blob_idx, o);
             fflush(NULL);
             _exit(r == 0 ? 0 : 1);
         }
         int st = 0; waitpid(pid, &st, 0);
         if (WIFSIGNALED(st)) {
-            printf("CRASH blob %d name=%s signal=%d last_ok=%d name=%s\n",
-                   i, names[i], WTERMSIG(st), last_ok,
-                   last_ok >= 0 ? names[last_ok] : "none");
+            printf("CRASH layer %d type=%s name=%s signal=%d | last_ok=%d type=%s name=%s\n",
+                   i, lrs[i]->type.c_str(), lrs[i]->name.c_str(), WTERMSIG(st),
+                   last_ok,
+                   last_ok >= 0 ? lrs[last_ok]->type.c_str() : "none",
+                   last_ok >= 0 ? lrs[last_ok]->name.c_str() : "none");
             fflush(NULL);
             return 3;
         }
         if (WIFEXITED(st) && WEXITSTATUS(st) == 0) last_ok = i;
     }
-    printf("ALL BLOBS OK\n");
+    printf("ALL LAYERS OK\n");
     return 0;
 }
 
