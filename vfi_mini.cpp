@@ -220,34 +220,44 @@ static int run_net(bool warp_gpu, const char* param, const char* bin,
             pb[y*W+x] = fmodf((x + y + c * 37.0f) / 255.0f, 1.0f);
         }
     }
-    ncnn::Mat six(W, H, 6);
-    for (int c = 0; c < 3; c++) {
-        memcpy(six.channel(c), a.channel(c), (size_t)W * H * 4);
-        memcpy(six.channel(3 + c), b.channel(c), (size_t)W * H * 4);
-    }
     ncnn::Mat ts(1, 1, 1); ts.channel(0)[0] = 0.5f;
     const std::vector<int>& ins = net.input_indexes();
-    std::vector<ncnn::Mat> shp = net.input_shapes();
-    int c_in = ((int)shp.size() == 1 && shp[0].dims == 3) ? shp[0].c : 0;
-    printf("inputs=%d c_in=%d\n", (int)ins.size(), c_in);
+    printf("inputs=%d\n", (int)ins.size());
+    auto make_input = [&](int ci) {
+        ncnn::Mat in(W, H, ci);
+        for (int c = 0; c < ci; c++) {
+            float* p = in.channel(c);
+            if (c < 3) memcpy(p, a.channel(c), (size_t)W * H * 4);
+            else if (c < 6) memcpy(p, b.channel(c - 3), (size_t)W * H * 4);
+            else if (c == 6) { for (int i = 0; i < W * H; i++) p[i] = 0.5f; }
+            else memset(p, 0, (size_t)W * H * 4);
+        }
+        return in;
+    };
+    int c_in = 0;
+    if ((int)ins.size() == 1) {
+        const int cands[4] = {7, 6, 11, 4};
+        for (int k = 0; k < 4; k++) {
+            ncnn::Extractor ex = net.create_extractor();
+            ex.input(ins[0], make_input(cands[k]));
+            ncnn::Mat o;
+            if (ex.extract(net.output_indexes()[0], o) == 0) {
+                c_in = cands[k];
+                break;
+            }
+        }
+        if (c_in == 0) {
+            fprintf(stderr, "ERR: no feed contract worked\n"); fflush(NULL);
+            return 3;
+        }
+        printf("single-input contract c_in=%d\n", c_in);
+    }
     auto feed = [&](ncnn::Extractor& ex) {
         if ((int)ins.size() >= 2) {
             ex.input(ins[0], a); ex.input(ins[1], b);
             if ((int)ins.size() >= 3) ex.input(ins[2], ts);
-        } else if (c_in >= 7) {
-            ncnn::Mat in(W, H, c_in);
-            for (int c = 0; c < c_in; c++) {
-                float* p = in.channel(c);
-                if (c < 3) memcpy(p, a.channel(c), (size_t)W * H * 4);
-                else if (c < 6) memcpy(p, b.channel(c - 3), (size_t)W * H * 4);
-                else if (c == 6) { for (int i = 0; i < W * H; i++) p[i] = 0.5f; }
-                else memset(p, 0, (size_t)W * H * 4);
-            }
-            ex.input(ins[0], in);
-        } else if (c_in == 6) {
-            ex.input(ins[0], six);
         } else {
-            ex.input(ins[0], six);
+            ex.input(ins[0], make_input(c_in));
         }
     };
     ncnn::Mat out;
