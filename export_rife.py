@@ -9,15 +9,17 @@ if ROOT not in sys.path:
 
 
 def _warp(x, flow):
+    # flow: (N,2,H,W) -> grid для F.grid_sample должен быть (N,H,W,2)
     N, C, H, W = x.shape
     ys = torch.arange(H, device=x.device, dtype=x.dtype)
     xs = torch.arange(W, device=x.device, dtype=x.dtype)
     gy, gx = torch.meshgrid(ys, xs, indexing="ij")
-    base = torch.stack([gx, gy], 0).unsqueeze(0)
-    vgrid = base + flow
+    base = torch.stack([gx, gy], dim=-1).unsqueeze(0)          # (1,H,W,2)
+    f = flow.permute(0, 2, 3, 1).float()                        # (N,H,W,2)
+    vgrid = base + f
     vgrid = torch.stack([
-        2.0 * vgrid[:, 0] / max(W - 1, 1) - 1.0,
-        2.0 * vgrid[:, 1] / max(H - 1, 1) - 1.0], 1)
+        2.0 * vgrid[..., 0] / max(W - 1, 1) - 1.0,
+        2.0 * vgrid[..., 1] / max(H - 1, 1) - 1.0], dim=-1)    # (N,H,W,2)
     return F.grid_sample(x, vgrid, align_corners=True)
 
 
@@ -38,7 +40,6 @@ def _load(path, name):
     return m
 
 
-# подтягиваем refine.py как model.refine, если RIFE_HDv3 его импортирует
 for d in sorted(glob.glob(os.path.join(ROOT, "**", "refine.py"), recursive=True)):
     try:
         rm = _load(d, "model.refine")
