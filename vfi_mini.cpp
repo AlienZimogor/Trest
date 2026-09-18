@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <thread>
+#include <atomic>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -20,6 +21,23 @@ static double now_ms() {
 }
 
 static bool g_warp_gpu = false;
+
+static std::atomic<int> g_frame{0};
+static std::atomic<int> g_frames{0};
+static volatile const char* g_phase = "init";
+
+static void start_heartbeat() {
+    std::thread([]() {
+        double t0 = now_ms();
+        for (;;) {
+            usleep(1000 * 1000);
+            fprintf(stderr, "ALIVE t=%.1fs phase=%s frame=%d/%d\n",
+                    (now_ms() - t0) / 1000.0, g_phase,
+                    g_frame.load(), g_frames.load());
+            fflush(stderr);
+        }
+    }).detach();
+}
 
 static void parse_opt(const char* e, int& threads, bool& fp16) {
     threads = 4; fp16 = false;
@@ -331,8 +349,17 @@ static int bisect(const char* param, const char* bin, int W, int H) {
         names[i] = lrs[i]->name;
         tops[i] = lrs[i]->tops.empty() ? -1 : lrs[i]->tops[0];
     }
+    const double bt0 = now_ms();
+    const int bsec = getenv("VFI_BISECT_SEC") ? atoi(getenv("VFI_BISECT_SEC")) : 20;
     for (int i = 0; i < n; i++) {
         if (tops[i] < 0) continue;
+        if (now_ms() - bt0 > bsec * 1000.0) {
+            printf("BISECT_BUDGET stop at %d/%d\n", i, n);
+            fflush(NULL);
+            break;
+        }
+        printf("BISECT %d/%d %s %s\n", i, n, types[i].c_str(), names[i].c_str());
+        fflush(NULL);
         pid_t pid = fork();
         if (pid == 0) {
             ncnn::Net net;
@@ -364,7 +391,7 @@ static int bisect(const char* param, const char* bin, int W, int H) {
             ncnn::Mat o;
             int r = ex.extract(tops[i], o);
             if (r == 0) {
-                if (i % 50 == 0)
+                if (i % 20 == 0)
                     printf("LAYEROK %d %s %s w=%d h=%d c=%d\n",
                            i, types[i].c_str(), names[i].c_str(), o.w, o.h, o.c);
             } else {
@@ -408,6 +435,7 @@ static int run_net(bool warp_gpu, bool use_vulkan,
     net.opt.use_packing_layout = false;
     net.opt.num_threads = threads;
     register_all(net);
+    g_phase = "load";
     if (net.load_param(param) != 0) {
         fprintf(stderr, "ERR: load_param failed\n"); fflush(NULL);
         return 2;
@@ -438,6 +466,7 @@ static int run_net(bool warp_gpu, bool use_vulkan,
         }
         return in;
     };
+    g_phase = "probe";
     int c_in = 0;
     if ((int)ins.size() == 1) {
         const int cands[4] = {7, 6, 11, 4};
@@ -468,6 +497,7 @@ static int run_net(bool warp_gpu, bool use_vulkan,
             ex.input(ins[0], make_input(c_in));
         }
     };
+    g_phase = "extract";
     ncnn::Mat out;
     {
         ncnn::Extractor ex = net.create_extractor();
@@ -488,8 +518,13 @@ static int run_net(bool warp_gpu, bool use_vulkan,
     if (!(sum == sum)) {
         fprintf(stderr, "WARN: NaN in output (%s)\n", label);
     }
+    g_phase = "timing";
+    g_frames = runs;
     double t0 = now_ms();
     for (int r = 0; r < runs; r++) {
+        g_frame = r + 1;
+        printf("FRAME %d/%d\n", r + 1, runs);
+        fflush(NULL);
         ncnn::Extractor e2 = net.create_extractor();
         feed(e2);
         ncnn::Mat o2;
@@ -502,6 +537,7 @@ static int run_net(bool warp_gpu, bool use_vulkan,
 }
 
 int main(int argc, char** argv) {
+    start_heartbeat();
     const char* param = argc > 1 ? argv[1] : "flownet.param";
     const char* bin   = argc > 2 ? argv[2] : "flownet.bin";
     int W = argc > 3 ? atoi(argv[3]) : 512;
