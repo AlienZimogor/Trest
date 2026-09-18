@@ -333,84 +333,65 @@ static void register_all(ncnn::Net& net) {
 }
 
 static int bisect(const char* param, const char* bin, int W, int H) {
-    ncnn::Net skeleton;
-    skeleton.opt.use_vulkan_compute = false;
-    if (skeleton.load_param(param) != 0) {
-        fprintf(stderr, "ERR: load_param failed in bisect\n");
+    int threads; bool fp16;
+    parse_opt(getenv("VFI_OPT"), threads, fp16);
+    ncnn::Net net;
+    net.opt.use_vulkan_compute = true;
+    net.set_vulkan_device(0);
+    net.opt.use_fp16_packed = fp16;
+    net.opt.use_fp16_storage = fp16;
+    net.opt.use_fp16_arithmetic = false;
+    net.opt.use_packing_layout = false;
+    net.opt.num_threads = threads;
+    register_all(net);
+    g_phase = "load";
+    if (net.load_param(param) != 0) {
+        fprintf(stderr, "ERR: load_param failed in bisect\n"); fflush(NULL);
         return 2;
     }
-    const std::vector<ncnn::Layer*>& lrs = skeleton.layers();
-    const int n = (int)lrs.size();
-    printf("bisect: layers=%d\n", n);
-    std::vector<std::string> types(n), names(n);
-    std::vector<int> tops(n, -1);
-    for (int i = 0; i < n; i++) {
-        types[i] = lrs[i]->type;
-        names[i] = lrs[i]->name;
-        tops[i] = lrs[i]->tops.empty() ? -1 : lrs[i]->tops[0];
+    if (net.load_model(bin) != 0) {
+        fprintf(stderr, "ERR: load_model failed in bisect\n"); fflush(NULL);
+        return 2;
     }
+    const std::vector<ncnn::Layer*>& lrs = net.layers();
+    const int n = (int)lrs.size();
+    printf("bisect: layers=%d (single-pass)\n", n);
+    fflush(NULL);
+    ncnn::Mat in(W, H, 7);
+    for (int c = 0; c < 7; c++) {
+        float* p = in.channel(c);
+        if (c < 3) {
+            for (int y = 0; y < H; y++) for (int x = 0; x < W; x++)
+                p[y*W+x] = fmodf((x + c * 37.0f) / 255.0f, 1.0f);
+        } else if (c < 6) {
+            for (int y = 0; y < H; y++) for (int x = 0; x < W; x++)
+                p[y*W+x] = fmodf((x + y + (c - 3) * 37.0f) / 255.0f, 1.0f);
+        } else {
+            for (int k = 0; k < W * H; k++) p[k] = 0.5f;
+        }
+    }
+    ncnn::Extractor ex = net.create_extractor();
+    ex.input(net.input_indexes()[0], in);
     const double bt0 = now_ms();
-    const int bsec = getenv("VFI_BISECT_SEC") ? atoi(getenv("VFI_BISECT_SEC")) : 20;
+    const int bsec = getenv("VFI_BISECT_SEC") ? atoi(getenv("VFI_BISECT_SEC")) : 240;
+    g_phase = "bisect";
+    g_frames = n;
     for (int i = 0; i < n; i++) {
-        if (tops[i] < 0) continue;
         if (now_ms() - bt0 > bsec * 1000.0) {
-            printf("BISECT_BUDGET stop at %d/%d\n", i, n);
-            fflush(NULL);
-            break;
-        }
-        printf("BISECT %d/%d %s %s\n", i, n, types[i].c_str(), names[i].c_str());
-        fflush(NULL);
-        pid_t pid = fork();
-        if (pid == 0) {
-            ncnn::Net net;
-            net.opt.use_vulkan_compute = true;
-            net.set_vulkan_device(0);
-            net.opt.use_fp16_packed = false;
-            net.opt.use_fp16_storage = false;
-            net.opt.use_fp16_arithmetic = false;
-            net.opt.use_packing_layout = false;
-            net.opt.num_threads = 1;
-            register_all(net);
-            if (net.load_param(param) != 0) { fflush(NULL); _exit(2); }
-            if (net.load_model(bin) != 0) { fflush(NULL); _exit(2); }
-            ncnn::Mat in(W, H, 7);
-            for (int c = 0; c < 7; c++) {
-                float* p = in.channel(c);
-                if (c < 3) {
-                    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++)
-                        p[y*W+x] = fmodf((x + c * 37.0f) / 255.0f, 1.0f);
-                } else if (c < 6) {
-                    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++)
-                        p[y*W+x] = fmodf((x + y + (c - 3) * 37.0f) / 255.0f, 1.0f);
-                } else {
-                    for (int k = 0; k < W * H; k++) p[k] = 0.5f;
-                }
-            }
-            ncnn::Extractor ex = net.create_extractor();
-            ex.input(net.input_indexes()[0], in);
-            ncnn::Mat o;
-            int r = ex.extract(tops[i], o);
-            if (r == 0) {
-                if (i % 20 == 0)
-                    printf("LAYEROK %d %s %s w=%d h=%d c=%d\n",
-                           i, types[i].c_str(), names[i].c_str(), o.w, o.h, o.c);
-            } else {
-                printf("LAYERFAIL %d %s %s rc=%d\n",
-                       i, types[i].c_str(), names[i].c_str(), r);
-            }
-            fflush(NULL);
-            _exit(r == 0 ? 0 : 1);
-        }
-        int st = 0; waitpid(pid, &st, 0);
-        if (WIFSIGNALED(st)) {
-            printf("CRASH %d %s %s signal=%d\n",
-                   i, types[i].c_str(), names[i].c_str(), WTERMSIG(st));
+            printf("BISECT_INCOMPLETE stop at %d/%d (budget)\n", i, n);
             fflush(NULL);
             return 3;
         }
-        if (WIFEXITED(st) && WEXITSTATUS(st) != 0) {
-            printf("STOP %d %s %s childrc=%d\n",
-                   i, types[i].c_str(), names[i].c_str(), WEXITSTATUS(st));
+        if (lrs[i]->tops.empty()) continue;
+        g_frame = i + 1;
+        ncnn::Mat o;
+        int r = ex.extract(lrs[i]->tops[0], o);
+        printf("BISECT %d/%d %s %s rc=%d w=%d h=%d c=%d\n",
+               i, n, lrs[i]->type.c_str(), lrs[i]->name.c_str(), r, o.w, o.h, o.c);
+        fflush(NULL);
+        if (r != 0) {
+            printf("BISECT_FAIL at %d %s %s rc=%d\n",
+                   i, lrs[i]->type.c_str(), lrs[i]->name.c_str(), r);
             fflush(NULL);
             return 3;
         }
@@ -473,10 +454,10 @@ static int run_net(bool warp_gpu, bool use_vulkan,
         for (int k = 0; k < 4; k++) {
             pid_t pid = fork();
             if (pid == 0) {
-                ncnn::Extractor ex = net.create_extractor();
-                ex.input(ins[0], make_input(cands[k]));
+                ncnn::Extractor ex2 = net.create_extractor();
+                ex2.input(ins[0], make_input(cands[k]));
                 ncnn::Mat o;
-                int r = ex.extract(net.output_indexes()[0], o);
+                int r = ex2.extract(net.output_indexes()[0], o);
                 fflush(NULL);
                 _exit(r == 0 ? 0 : 1);
             }
