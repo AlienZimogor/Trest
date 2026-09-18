@@ -100,32 +100,25 @@ public:
                         const ncnn::Option& opt) const {
         const ncnn::Mat& x = bb[0];
         const ncnn::Mat& grid = bb[1];
-        if (x.empty() || grid.empty() || grid.c != 2) {
-            fprintf(stderr, "GRIDSAMPLE_GUARD %s x=%dx%dx%d grid=%dx%dx%d xempty=%d gempty=%d\n",
-                    name.c_str(), x.w, x.h, x.c, grid.w, grid.h, grid.c,
-                    x.empty() ? 1 : 0, grid.empty() ? 1 : 0);
-            return -100;
-        }
-        if (x.elemsize != 4u || grid.elemsize != 4u ||
-            x.elempack != 1 || grid.elempack != 1) {
-            fprintf(stderr, "GRIDSAMPLE_GUARD2 %s xs=%zu xe=%d fs=%zu fe=%d\n",
-                    name.c_str(), x.elemsize, x.elempack, grid.elemsize, grid.elempack);
-            return -101;
-        }
         const int IW = x.w, IH = x.h, C = x.c;
         const int GW = grid.w, GH = grid.h;
+        if (x.empty() || grid.empty() || grid.elemsize != 4u || grid.elempack != 1 ||
+            (int)grid.total() < GW * GH * 2) {
+            fprintf(stderr, "GRIDSAMPLE_GUARD %s x=%dx%dx%d grid=%dx%dx%d total=%d\n",
+                    name.c_str(), IW, IH, C, GW, GH, grid.c, (int)grid.total());
+            return -100;
+        }
         ncnn::Mat& top = tb[0];
         top.create(GW, GH, C, 4u, opt.blob_allocator);
         if (top.empty()) return -100;
-        const float* gx = grid.channel(0);
-        const float* gy = grid.channel(1);
+        const float* gp = (const float*)grid.data;
         for (int c = 0; c < C; c++) {
             const float* xp = x.channel(c);
             float* tp = top.channel(c);
             for (int y = 0; y < GH; y++) {
                 for (int xi = 0; xi < GW; xi++) {
-                    const float g0 = gx[y * GW + xi];
-                    const float g1 = gy[y * GW + xi];
+                    const float g0 = gp[(y * GW + xi) * 2];
+                    const float g1 = gp[(y * GW + xi) * 2 + 1];
                     float sx, sy;
                     if (align_corners) {
                         sx = (g0 + 1.f) * (IW - 1) * 0.5f;
@@ -316,6 +309,8 @@ public:
 static ncnn::Layer* Warp_layer_creator(void*) { return new Warp_layer; }
 
 static void register_all(ncnn::Net& net) {
+    net.register_custom_layer(ncnn::layer_to_index("Reshape"), Reshape_fix_creator);
+    net.register_custom_layer(ncnn::layer_to_index("GridSample"), GridSample_fix_creator);
     net.register_custom_layer("rife.Warp", Warp_layer_creator);
 }
 
