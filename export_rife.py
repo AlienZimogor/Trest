@@ -28,6 +28,21 @@ def _noop(*a, **k):
     return None
 
 
+class _DummyObj:
+    def __init__(self, *a, **k):
+        pass
+    def __call__(self, *a, **k):
+        return torch.zeros(1)
+    def __getattr__(self, n):
+        return _noop
+
+
+def _install_dynamic_globals(mod):
+    def _getattr(name):
+        return _DummyObj
+    mod.__getattr__ = _getattr
+
+
 def _finish_module(mod, name, is_package=True):
     spec = importlib.machinery.ModuleSpec(name, loader=None, is_package=is_package)
     spec.origin = "<stub>"
@@ -43,7 +58,6 @@ def _finish_module(mod, name, is_package=True):
 def _make_stub(name):
     mod = types.ModuleType(name)
     _finish_module(mod, name, is_package=True)
-
     def _getattr(attr):
         if attr.startswith("_"):
             raise AttributeError(attr)
@@ -82,7 +96,9 @@ def _load(path, name):
 def _load_with_stubs(path, name, max_stub=10):
     for _ in range(max_stub):
         try:
-            return _load(path, name)
+            m = _load(path, name)
+            _install_dynamic_globals(m)
+            return m
         except ModuleNotFoundError as e:
             missing = e.name
             print("  auto-stub module:", missing)
@@ -279,8 +295,8 @@ for set_name, py_base, class_names in TARGETS:
         try:
             net = ctor()
             break
-        except TypeError as e:
-            print("  ctor fail:", e)
+        except Exception as e:
+            print("  ctor fail:", type(e).__name__, e)
             continue
     if net is None:
         print("SKIP: all constructors failed")
