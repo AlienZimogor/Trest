@@ -186,7 +186,7 @@ for set_name, py_base, class_names in TARGETS:
     w, fparams = make_wrapper(net)
     print("SET %s: forward params %s" % (set_name, fparams))
     onnx_path = "rife_%s.onnx" % set_name
-    dummy = torch.randn(1, 7, 288, 512)
+    dummy = torch.randn(1, 7, 384, 512)
     with torch.no_grad():
         ref = w(dummy)
     print("SET %s REF out %s mean=%.4f min=%.4f max=%.4f" %
@@ -195,7 +195,7 @@ for set_name, py_base, class_names in TARGETS:
                       input_names=["in0"], output_names=["out0"],
                       do_constant_folding=True)
     pnnx = shutil.which("pnnx") or "pnnx"
-    r = subprocess.run([pnnx, onnx_path, "inputshape=[1,7,288,512]"],
+    r = subprocess.run([pnnx, onnx_path, "inputshape=[1,7,384,512]"],
                        capture_output=True, text=True)
     print("SET %s pnnx rc=%d" % (set_name, r.returncode))
     if r.returncode != 0:
