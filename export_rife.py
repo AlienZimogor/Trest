@@ -9,17 +9,16 @@ if ROOT not in sys.path:
 
 
 def _warp(x, flow):
-    # flow: (N,2,H,W) -> grid для F.grid_sample должен быть (N,H,W,2)
     N, C, H, W = x.shape
     ys = torch.arange(H, device=x.device, dtype=x.dtype)
     xs = torch.arange(W, device=x.device, dtype=x.dtype)
     gy, gx = torch.meshgrid(ys, xs, indexing="ij")
-    base = torch.stack([gx, gy], dim=-1).unsqueeze(0)          # (1,H,W,2)
-    f = flow.permute(0, 2, 3, 1).float()                        # (N,H,W,2)
+    base = torch.stack([gx, gy], dim=-1).unsqueeze(0)
+    f = flow.permute(0, 2, 3, 1).float()
     vgrid = base + f
     vgrid = torch.stack([
         2.0 * vgrid[..., 0] / max(W - 1, 1) - 1.0,
-        2.0 * vgrid[..., 1] / max(H - 1, 1) - 1.0], dim=-1)    # (N,H,W,2)
+        2.0 * vgrid[..., 1] / max(H - 1, 1) - 1.0], dim=-1)
     return F.grid_sample(x, vgrid, align_corners=True)
 
 
@@ -106,6 +105,9 @@ def find_py(base):
 
 def make_wrapper(net):
     fparams = list(inspect.signature(net.forward).parameters.keys())
+    nblk = len(getattr(net, "block", []) or []) or 5
+    scale_list = [float(2 ** (nblk - j)) for j in range(nblk)]
+    print("blocks=%d scale_list=%s" % (nblk, scale_list))
 
     class W(nn.Module):
         def __init__(s):
@@ -119,17 +121,21 @@ def make_wrapper(net):
             ts = tm.mean(dim=(2, 3), keepdim=True)
             c6 = torch.cat([i0, i1], 1)
             if fparams and fparams[0] in ("x", "inputs", "inp", "frame"):
+                if "scale_list" in fparams and "timestep" in fparams:
+                    return s.n(c6, ts, scale_list)
                 if "timestep" in fparams:
                     return s.n(c6, ts)
                 return s.n(c6)
             if fparams and fparams[0] in ("img0", "x0", "image0"):
+                if "scale_list" in fparams and "timestep" in fparams:
+                    return s.n(i0, i1, ts, scale_list)
                 if "timestep" in fparams:
                     return s.n(i0, i1, ts)
                 return s.n(i0, i1)
             last = None
-            for fn in (lambda: s.n(c6, ts), lambda: s.n(c6),
-                       lambda: s.n(x, ts), lambda: s.n(x),
-                       lambda: s.n(i0, i1, ts), lambda: s.n(i0, i1)):
+            for fn in (lambda: s.n(c6, ts, scale_list), lambda: s.n(c6, ts), lambda: s.n(c6),
+                       lambda: s.n(x, ts, scale_list), lambda: s.n(x, ts), lambda: s.n(x),
+                       lambda: s.n(i0, i1, ts, scale_list), lambda: s.n(i0, i1, ts), lambda: s.n(i0, i1)):
                 try:
                     return fn()
                 except Exception as e:
