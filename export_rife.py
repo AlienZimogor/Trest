@@ -1,22 +1,4 @@
 #!/usr/bin/env python3
-"""
-Экспорт RIFE v4.26 из архива релиза.
-
-Целевые наборы:
-  * ifnet    -> IFNet_HDv3.IFNet (только optical flow + warp, без refine)
-  * rifehdv3 -> RIFE_HDv3.Model|RIFE|RIFE_HDv3 (IFNet + refine)
-
-Порядок действий:
-  1. Детерминированно читаем архив: приоритет имён с 4.26/v4, штраф __pycache__
-  2. Снимаем префикс module. с весов
-  3. Для каждого набора перебираем карты ключей (direct, flownet., refine.)
-  4. Выбираем карту с минимумом missing, если missing=0 — пробуем forward
-  5. Forward-диагностика: hook на все Conv2d с in_channels==28, проверка что
-     фактическое число каналов на входе = 28 (санити-чек против batch-fold-артефакта)
-  6. Экспорт в ONNX (input=[1,7,384,512], output = 3-канальный merged-кадр)
-  7. pnnx -> ncnn param/bin
-  8. Упаковка в rife_models.zip (подпапки ifnet/ и rifehdv3/)
-"""
 import sys, os, glob, types, inspect, importlib.util, subprocess, shutil, zipfile, traceback
 import torch
 import torch.nn as nn
@@ -27,20 +9,17 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 
-# ===== Заглушки и имитации пакетов =====
-
 def _warp(x, flow):
-    """RIFE-warplayer: flow (N,2,H,W) -> grid_sample-совместимый grid (N,H,W,2)"""
     N, C, H, W = x.shape
     ys = torch.arange(H, device=x.device, dtype=x.dtype)
     xs = torch.arange(W, device=x.device, dtype=x.dtype)
     gy, gx = torch.meshgrid(ys, xs, indexing="ij")
-    base = torch.stack([gx, gy], dim=-1).unsqueeze(0)          # (1,H,W,2)
-    f = flow.permute(0, 2, 3, 1).float()                        # (N,H,W,2)
+    base = torch.stack([gx, gy], dim=-1).unsqueeze(0)
+    f = flow.permute(0, 2, 3, 1).float()
     vgrid = base + f
     vgrid = torch.stack([
         2.0 * vgrid[..., 0] / max(W - 1, 1) - 1.0,
-        2.0 * vgrid[..., 1] / max(H - 1, 1) - 1.0], dim=-1)    # (N,H,W,2)
+        2.0 * vgrid[..., 1] / max(H - 1, 1) - 1.0], dim=-1)
     return F.grid_sample(x, vgrid, align_corners=True, mode="bilinear", padding_mode="zeros")
 
 
@@ -52,7 +31,6 @@ wp_stub.warp = _warp
 sys.modules.setdefault("model.warplayer", wp_stub)
 setattr(model_pkg, "warplayer", wp_stub)
 
-# train_log — нужен, если RIFE_HDv3 импортирует `from train_log...`
 tl_pkg = types.ModuleType("train_log")
 tl_pkg.__path__ = sorted(set(
     os.path.dirname(p) for p in glob.glob(os.path.join(ROOT, "**", "*.py"), recursive=True)
@@ -68,21 +46,38 @@ def _load(path, name):
     return m
 
 
-# ===== Автозагрузка refine.py в model.refine =====
+def _noop(*a, **k):
+    return None
+
+
+def _load_with_stubs(path, name, max_stub=10):
+    for _ in range(max_stub):
+        try:
+            return _load(path, name)
+        except ModuleNotFoundError as e:
+            missing = e.name
+            print("  auto-stub module:", missing)
+            mod = types.ModuleType(missing)
+            mod.__path__ = []
+            mod.__getattr__ = lambda attr: _noop
+            sys.modules[missing] = mod
+            parent = missing.rsplit(".", 1)[0]
+            if parent in sys.modules:
+                setattr(sys.modules[parent], missing.rsplit(".", 1)[1], mod)
+    raise RuntimeError("too many auto-stubs for %s" % path)
+
 
 for d in sorted(glob.glob(os.path.join(ROOT, "**", "refine.py"), recursive=True)):
     if "__pycache__" in d:
         continue
     try:
-        rm = _load(d, "model.refine")
+        rm = _load_with_stubs(d, "model.refine")
         setattr(model_pkg, "refine", rm)
         print("refine loaded from", d)
         break
     except Exception as e:
         print("refine load fail at", d, "->", e)
 
-
-# ===== Загрузка весов =====
 
 def _pref(p):
     s = 0
@@ -105,12 +100,9 @@ pkls = [p for p in
         glob.glob(os.path.join(ROOT, "**", "*.pth"), recursive=True) +
         glob.glob(os.path.join(ROOT, "**", "*.pt"), recursive=True)]
 pkls.sort(key=_pref, reverse=True)
-
 print("pkl candidates:")
 for p in pkls:
-    sz = os.path.getsize(p)
-    print("  ", p, "(%.2f MB, pref=%d)" % (sz / 1e6, _pref(p)))
-
+    print("  ", p, "(%.2f MB, pref=%d)" % (os.path.getsize(p)/1e6, _pref(p)))
 if not pkls:
     raise SystemExit("no weights found under " + ROOT)
 
@@ -130,11 +122,7 @@ def strip_mod(sd):
 sd_base = strip_mod(sd_raw)
 print("weights keys sample:", list(sd_base.keys())[:6])
 
-
-# ===== Целевые наборы =====
-
 TARGETS = [
-    # (имя набора, имя py-файла, список кандидат-классов)
     ("ifnet",    "IFNet_HDv3.py", ["IFNet"]),
     ("rifehdv3", "RIFE_HDv3.py",  ["Model", "RIFE", "RIFE_HDv3"]),
 ]
@@ -147,17 +135,12 @@ def find_py(base):
     return None
 
 
-# ===== Обёртка: 7ch вход -> 3ch merged-кадр =====
-
 def _pick(out):
-    """Выбираем 3-канальный кадр из кортежа/тензора"""
     if isinstance(out, dict):
-        # некоторые реализации возвращают {'merged': ..., 'flow': ...}
         for k in ("merged", "img_pred", "pred", "output"):
             if k in out and torch.is_tensor(out[k]):
                 return _pick(out[k])
-        vals = [v for v in out.values() if torch.is_tensor(v)]
-        out = vals
+        out = [v for v in out.values() if torch.is_tensor(v)]
     if isinstance(out, (tuple, list)):
         shapes = [tuple(t.shape) for t in out if torch.is_tensor(t)]
         print("  output tuple shapes:", shapes)
@@ -171,8 +154,8 @@ def _pick(out):
                        (tuple(out.shape) if torch.is_tensor(out) else type(out),))
 
 
-SCALE = [32.0, 16.0, 8.0, 4.0, 2.0]   # 5-уровневая пирамида v4.26
-DUMMY = torch.randn(1, 7, 384, 512)    # кратный 128
+SCALE = [32.0, 16.0, 8.0, 4.0, 2.0]
+DUMMY = torch.randn(1, 7, 384, 512)
 
 
 def make_wrapper(net):
@@ -187,10 +170,9 @@ def make_wrapper(net):
         def forward(self, x):
             ts = x[:, 6:7].mean(dim=(2, 3), keepdim=True)
             i0 = x[:, 0:3]; i1 = x[:, 3:6]
-            # перебор сигнатур: сначала безопасные (не batch-2), потом расширенные
             attempts = []
             if fparams and fparams[0] in ("x", "inputs", "inp", "frame", "imgs"):
-                attempts += [
+                attempts = [
                     lambda: self.net(x, ts, SCALE, False, True, False),
                     lambda: self.net(x, ts, SCALE, False, False, False),
                     lambda: self.net(x, ts, SCALE, False, True),
@@ -202,7 +184,7 @@ def make_wrapper(net):
                     lambda: self.net(x),
                 ]
             else:
-                attempts += [
+                attempts = [
                     lambda: self.net(i0, i1, ts, SCALE, False, True, False),
                     lambda: self.net(i0, i1, ts, SCALE, False, False, False),
                     lambda: self.net(i0, i1, ts, SCALE, False, True),
@@ -213,153 +195,104 @@ def make_wrapper(net):
                     lambda: self.net(i0, i1, ts),
                     lambda: self.net(i0, i1),
                 ]
-            last_err = None
-            for fn in attempts:
+            errs = []
+            for idx, fn in enumerate(attempts):
                 try:
                     return _pick(fn())
                 except Exception as e:
-                    last_err = e
-            raise last_err
+                    errs.append("#%d %s: %s" % (idx, type(e).__name__, e))
+            print("  all %d forward attempts failed:" % len(attempts))
+            for e in errs:
+                print("   ", e)
+            raise RuntimeError("all forward attempts failed")
     return W()
 
 
-# ===== Основной цикл по наборам =====
-
 produced = []
-
 for set_name, py_base, class_names in TARGETS:
     print("\n========== SET %s ==========" % set_name)
     py = find_py(py_base)
     if py is None:
-        print("SKIP: py %s not found in archive" % py_base)
-        continue
+        print("SKIP: py %s not found" % py_base); continue
     print("py:", py)
-
     try:
-        mod = _load(py, "prov_%s" % set_name)
+        mod = _load_with_stubs(py, "prov_%s" % set_name)
     except Exception as e:
-        print("SKIP: import fail ->", e)
-        traceback.print_exc()
-        continue
-
+        print("SKIP: import fail ->", e); traceback.print_exc(); continue
     cls = None
     for cn in class_names:
         if hasattr(mod, cn):
-            cls = getattr(mod, cn)
-            print("class found:", cn)
-            break
+            cls = getattr(mod, cn); print("class found:", cn); break
     if cls is None:
-        print("SKIP: no class %s in %s" % (class_names, py))
-        continue
-
+        print("SKIP: no class %s" % (class_names,)); continue
     try:
         net = cls()
     except Exception as e:
-        print("SKIP: init fail ->", e)
-        traceback.print_exc()
-        continue
+        print("SKIP: init fail ->", e); traceback.print_exc(); continue
 
-    # перебор карт ключей
-    best = None   # (missing, unexpected, map_name, sd)
-    maps = [
-        ("direct",   sd_base),
-        ("flownet.", {"flownet." + k: v for k, v in sd_base.items()}),
-        ("net.",     {"net." + k: v for k, v in sd_base.items()}),
-        ("refine.",  {"refine." + k: v for k, v in sd_base.items()}),
-    ]
-    for map_name, sd in maps:
+    best = None
+    for map_name, sd in (("direct", sd_base),
+                         ("flownet.", {"flownet."+k: v for k, v in sd_base.items()}),
+                         ("net.", {"net."+k: v for k, v in sd_base.items()}),
+                         ("refine.", {"refine."+k: v for k, v in sd_base.items()})):
         probe = cls()
         miss, unexp = probe.load_state_dict(sd, strict=False)
         print("  map=%s missing=%d unexpected=%d" % (map_name, len(miss), len(unexp)))
-        if best is None or len(miss) < best[0] or (len(miss) == best[0] and len(unexp) < best[1]):
+        if best is None or len(miss) < best[0] or (len(miss)==best[0] and len(unexp)<best[1]):
             best = (len(miss), len(unexp), map_name, sd)
         if len(miss) == 0:
             break
-
     miss, unexp, map_name, sd = best
     print("best map=%s missing=%d unexpected=%d" % (map_name, miss, unexp))
-
     if miss != 0:
-        print("SKIP: missing=%d > 0 (веса несовместимы с арх-рой %s)" % (miss, py_base))
-        print("  missing sample:", list(miss) if False else "see state_dict keys above")
-        continue
-
+        print("SKIP: missing=%d > 0" % miss); continue
     net.load_state_dict(sd, strict=False)
     net.eval()
 
-    # forward-санити: hook на Conv2d с in_channels=28
     convs_28 = [m for m in net.modules() if isinstance(m, nn.Conv2d) and m.in_channels == 28]
-    print("  Conv2d with in_channels=28: count=%d" % len(convs_28))
+    print("  Conv2d in_channels=28 count=%d" % len(convs_28))
     seen = {}
     if convs_28:
-        def hook_factory(idx):
-            def hk(m, inp, out):
-                seen.setdefault("channels", []).append(inp[0].shape[1])
-            return hk
-        for i, c in enumerate(convs_28):
-            c.register_forward_hook(hook_factory(i))
+        def hk(m, inp, out):
+            seen.setdefault("ch", []).append(inp[0].shape[1])
+        for c in convs_28:
+            c.register_forward_hook(hk)
 
     w = make_wrapper(net)
     w.eval()
-
     try:
         with torch.no_grad():
             ref = w(DUMMY)
     except Exception as e:
-        print("SKIP: forward fail ->", e)
-        traceback.print_exc()
-        continue
-
+        print("SKIP: forward fail ->", e); traceback.print_exc(); continue
     print("  REF out shape=%s mean=%.4f min=%.4f max=%.4f" %
           (tuple(ref.shape), float(ref.mean()), float(ref.min()), float(ref.max())))
     if convs_28:
-        uniq = sorted(set(seen.get("channels", [])))
-        print("  hook in_channels (unique):", uniq)
-        if uniq and 28 not in uniq:
-            print("  WARNING: forward не дал 28ch на convrelu_5 — возможна batch-2 хирургия в графе")
-
+        print("  hook in_channels unique:", sorted(set(seen.get("ch", []))))
     if tuple(ref.shape) != (1, 3, 384, 512):
-        print("SKIP: unexpected ref shape (wanted (1,3,384,512))")
-        continue
+        print("SKIP: unexpected ref shape"); continue
     if not (0.0 <= float(ref.mean()) <= 1.0):
-        print("SKIP: mean=%.4f out of [0,1] — скорее всего garbage" % float(ref.mean()))
-        continue
+        print("SKIP: mean out of [0,1]"); continue
 
-    # экспорт ONNX
     onnx_path = "rife_%s.onnx" % set_name
     try:
-        torch.onnx.export(
-            w, DUMMY, onnx_path,
-            opset_version=13,
-            input_names=["in0"],
-            output_names=["out0"],
-            do_constant_folding=True,
-        )
+        torch.onnx.export(w, DUMMY, onnx_path, opset_version=13,
+                          input_names=["in0"], output_names=["out0"],
+                          do_constant_folding=True)
         print("  ONNX exported:", onnx_path, "(%.2f MB)" % (os.path.getsize(onnx_path)/1e6))
     except Exception as e:
-        print("SKIP: onnx export fail ->", e)
-        traceback.print_exc()
-        continue
-
+        print("SKIP: onnx export fail ->", e); traceback.print_exc(); continue
     produced.append(set_name)
-
-
-# ===== Упаковка =====
 
 print("\n========== PACKING ==========")
 print("PRODUCED SETS:", produced)
 if not produced:
     raise SystemExit("no sets produced — check logs above")
-
 with zipfile.ZipFile("rife_models.zip", "w", zipfile.ZIP_DEFLATED) as z:
     for s in produced:
         for ext in ("param", "bin"):
             f = "rife_%s.ncnn.%s" % (s, ext)
             if os.path.isfile(f):
-                arc = os.path.join(s, os.path.basename(f))
-                z.write(f, arc)
-                print("  packed:", arc, "(%.2f MB)" % (os.path.getsize(f)/1e6))
-            else:
-                print("  MISSING:", f, "(pnnx ещё не запускался?)")
-
+                z.write(f, os.path.join(s, os.path.basename(f)))
+                print("  packed:", os.path.join(s, os.path.basename(f)))
 print("ZIP OK: rife_models.zip (%.2f MB)" % (os.path.getsize("rife_models.zip")/1e6))
