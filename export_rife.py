@@ -59,6 +59,7 @@ def _load_with_stubs(path, name, max_stub=10):
             print("  auto-stub module:", missing)
             mod = types.ModuleType(missing)
             mod.__path__ = []
+            mod.__all__ = []
             mod.__getattr__ = lambda attr: _noop
             sys.modules[missing] = mod
             parent = missing.rsplit(".", 1)[0]
@@ -110,6 +111,7 @@ sd_raw = torch.load(pkls[0], map_location="cpu", weights_only=False)
 if isinstance(sd_raw, dict) and "state_dict" in sd_raw:
     sd_raw = sd_raw["state_dict"]
 
+
 def strip_mod(sd):
     out = {}
     for k, v in sd.items():
@@ -119,12 +121,16 @@ def strip_mod(sd):
         out[k2] = v
     return out
 
+
 sd_base = strip_mod(sd_raw)
+sd_ifnet = {k: v for k, v in sd_base.items() if not k.startswith("refine.")}
+sd_refine = {k[len("refine."):]: v for k, v in sd_base.items() if k.startswith("refine.")}
 print("weights keys sample:", list(sd_base.keys())[:6])
+print("ifnet keys=%d refine keys=%d" % (len(sd_ifnet), len(sd_refine)))
 
 TARGETS = [
+    ("rifehdv3", "RIFE_HDv3.py", ["Model", "RIFE", "RIFE_HDv3"]),
     ("ifnet",    "IFNet_HDv3.py", ["IFNet"]),
-    ("rifehdv3", "RIFE_HDv3.py",  ["Model", "RIFE", "RIFE_HDv3"]),
 ]
 
 
@@ -154,11 +160,38 @@ def _pick(out):
                        (tuple(out.shape) if torch.is_tensor(out) else type(out),))
 
 
+DUMMY = torch.rand(1, 7, 384, 512)
 SCALE = [32.0, 16.0, 8.0, 4.0, 2.0]
-DUMMY = torch.randn(1, 7, 384, 512)
 
 
-def make_wrapper(net):
+def make_wrapper_model(net):
+    class W(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = net
+
+        def forward(self, x):
+            i0 = x[:, 0:3]
+            i1 = x[:, 3:6]
+            errs = []
+            for idx, fn in enumerate((
+                lambda: self.net.inference(i0, i1, 0.5),
+                lambda: self.net.inference(i0, i1, timestep=0.5),
+                lambda: self.net.inference(i0, i1),
+                lambda: self.net(i0, i1, 0.5),
+            )):
+                try:
+                    return _pick(fn())
+                except Exception as e:
+                    errs.append("#%d %s: %s" % (idx, type(e).__name__, e))
+            print("  Model inference attempts failed:")
+            for e in errs:
+                print("   ", e)
+            raise RuntimeError("Model inference failed")
+    return W()
+
+
+def make_wrapper_ifnet(net):
     fparams = list(inspect.signature(net.forward).parameters.keys())
     print("  forward params:", fparams)
 
@@ -170,41 +203,25 @@ def make_wrapper(net):
         def forward(self, x):
             ts = x[:, 6:7].mean(dim=(2, 3), keepdim=True)
             i0 = x[:, 0:3]; i1 = x[:, 3:6]
-            attempts = []
-            if fparams and fparams[0] in ("x", "inputs", "inp", "frame", "imgs"):
-                attempts = [
-                    lambda: self.net(x, ts, SCALE, False, True, False),
-                    lambda: self.net(x, ts, SCALE, False, False, False),
-                    lambda: self.net(x, ts, SCALE, False, True),
-                    lambda: self.net(x, ts, SCALE, False, False),
-                    lambda: self.net(x, ts, SCALE, True),
-                    lambda: self.net(x, ts, SCALE, False),
-                    lambda: self.net(x, ts, SCALE),
-                    lambda: self.net(x, ts),
-                    lambda: self.net(x),
-                ]
-            else:
-                attempts = [
-                    lambda: self.net(i0, i1, ts, SCALE, False, True, False),
-                    lambda: self.net(i0, i1, ts, SCALE, False, False, False),
-                    lambda: self.net(i0, i1, ts, SCALE, False, True),
-                    lambda: self.net(i0, i1, ts, SCALE, False, False),
-                    lambda: self.net(i0, i1, ts, SCALE, True),
-                    lambda: self.net(i0, i1, ts, SCALE, False),
-                    lambda: self.net(i0, i1, ts, SCALE),
-                    lambda: self.net(i0, i1, ts),
-                    lambda: self.net(i0, i1),
-                ]
+            attempts = [
+                lambda: self.net(x, ts, SCALE, False, True, False),
+                lambda: self.net(x, ts, SCALE, False, False, False),
+                lambda: self.net(x, ts, SCALE, False, True),
+                lambda: self.net(x, ts, SCALE, False, False),
+                lambda: self.net(x, ts, SCALE),
+                lambda: self.net(x, ts),
+                lambda: self.net(x),
+            ]
             errs = []
             for idx, fn in enumerate(attempts):
                 try:
                     return _pick(fn())
                 except Exception as e:
                     errs.append("#%d %s: %s" % (idx, type(e).__name__, e))
-            print("  all %d forward attempts failed:" % len(attempts))
+            print("  IFNet forward attempts failed:")
             for e in errs:
                 print("   ", e)
-            raise RuntimeError("all forward attempts failed")
+            raise RuntimeError("IFNet forward failed")
     return W()
 
 
@@ -213,43 +230,43 @@ for set_name, py_base, class_names in TARGETS:
     print("\n========== SET %s ==========" % set_name)
     py = find_py(py_base)
     if py is None:
-        print("SKIP: py %s not found" % py_base); continue
+        print("SKIP: py %s not found" % py_base)
+        continue
     print("py:", py)
     try:
         mod = _load_with_stubs(py, "prov_%s" % set_name)
     except Exception as e:
-        print("SKIP: import fail ->", e); traceback.print_exc(); continue
+        print("SKIP: import fail ->", e)
+        traceback.print_exc()
+        continue
     cls = None
     for cn in class_names:
         if hasattr(mod, cn):
-            cls = getattr(mod, cn); print("class found:", cn); break
+            cls = getattr(mod, cn)
+            print("class found:", cn)
+            break
     if cls is None:
-        print("SKIP: no class %s" % (class_names,)); continue
+        print("SKIP: no class %s" % (class_names,))
+        continue
     try:
         net = cls()
     except Exception as e:
-        print("SKIP: init fail ->", e); traceback.print_exc(); continue
+        print("SKIP: init fail ->", e)
+        traceback.print_exc()
+        continue
 
-    best = None
-    for map_name, sd in (("direct", sd_base),
-                         ("flownet.", {"flownet."+k: v for k, v in sd_base.items()}),
-                         ("net.", {"net."+k: v for k, v in sd_base.items()}),
-                         ("refine.", {"refine."+k: v for k, v in sd_base.items()})):
-        probe = cls()
-        miss, unexp = probe.load_state_dict(sd, strict=False)
-        print("  map=%s missing=%d unexpected=%d" % (map_name, len(miss), len(unexp)))
-        if best is None or len(miss) < best[0] or (len(miss)==best[0] and len(unexp)<best[1]):
-            best = (len(miss), len(unexp), map_name, sd)
-        if len(miss) == 0:
-            break
-    miss, unexp, map_name, sd = best
-    print("best map=%s missing=%d unexpected=%d" % (map_name, miss, unexp))
-    if miss != 0:
-        print("SKIP: missing=%d > 0" % miss); continue
-    net.load_state_dict(sd, strict=False)
+    target = getattr(net, "flownet", net)
+    miss, unexp = target.load_state_dict(sd_ifnet, strict=False)
+    print("  flownet/IFNet load missing=%d unexpected=%d" % (len(miss), len(unexp)))
+    if hasattr(net, "refine") and sd_refine:
+        m2, u2 = net.refine.load_state_dict(sd_refine, strict=False)
+        print("  refine load missing=%d unexpected=%d" % (len(m2), len(u2)))
+    if len(miss) != 0:
+        print("SKIP: missing=%d > 0" % len(miss))
+        continue
     net.eval()
 
-    convs_28 = [m for m in net.modules() if isinstance(m, nn.Conv2d) and m.in_channels == 28]
+    convs_28 = [m for m in target.modules() if isinstance(m, nn.Conv2d) and m.in_channels == 28]
     print("  Conv2d in_channels=28 count=%d" % len(convs_28))
     seen = {}
     if convs_28:
@@ -258,21 +275,25 @@ for set_name, py_base, class_names in TARGETS:
         for c in convs_28:
             c.register_forward_hook(hk)
 
-    w = make_wrapper(net)
+    w = make_wrapper_model(net) if set_name == "rifehdv3" else make_wrapper_ifnet(net)
     w.eval()
     try:
         with torch.no_grad():
             ref = w(DUMMY)
     except Exception as e:
-        print("SKIP: forward fail ->", e); traceback.print_exc(); continue
+        print("SKIP: forward fail ->", e)
+        traceback.print_exc()
+        continue
     print("  REF out shape=%s mean=%.4f min=%.4f max=%.4f" %
           (tuple(ref.shape), float(ref.mean()), float(ref.min()), float(ref.max())))
     if convs_28:
         print("  hook in_channels unique:", sorted(set(seen.get("ch", []))))
     if tuple(ref.shape) != (1, 3, 384, 512):
-        print("SKIP: unexpected ref shape"); continue
+        print("SKIP: unexpected ref shape (wanted (1,3,384,512))")
+        continue
     if not (0.0 <= float(ref.mean()) <= 1.0):
-        print("SKIP: mean out of [0,1]"); continue
+        print("SKIP: mean out of [0,1]")
+        continue
 
     onnx_path = "rife_%s.onnx" % set_name
     try:
@@ -281,7 +302,9 @@ for set_name, py_base, class_names in TARGETS:
                           do_constant_folding=True)
         print("  ONNX exported:", onnx_path, "(%.2f MB)" % (os.path.getsize(onnx_path)/1e6))
     except Exception as e:
-        print("SKIP: onnx export fail ->", e); traceback.print_exc(); continue
+        print("SKIP: onnx export fail ->", e)
+        traceback.print_exc()
+        continue
     produced.append(set_name)
 
 print("\n========== PACKING ==========")
