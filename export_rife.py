@@ -29,11 +29,10 @@ def _pick(out):
         c3 = [t for t in out if torch.is_tensor(t) and t.dim() == 4 and t.shape[1] == 3]
         if c3:
             return c3[-1]
-        c4 = [t for t in out if torch.is_tensor(t) and t.dim() == 4]
-        if c4:
-            return c4[-1]
-        raise RuntimeError("no usable tensor in output tuple: %s" % (shapes,))
-    return out
+        raise RuntimeError("no 3-channel frame in output tuple: %s" % (shapes,))
+    if out.dim() == 4 and out.shape[1] == 3:
+        return out
+    raise RuntimeError("output is not a 3-channel frame: %s" % (tuple(out.shape),))
 
 
 model_pkg = types.ModuleType("model")
@@ -129,19 +128,19 @@ def make_wrapper(net):
             s.n = net
 
         def forward(s, x):
+            # x = (N,7,H,W): img0(3)+img1(3)+timestep(1); модель сама делит его внутри
             i0 = x[:, 0:3]
             i1 = x[:, 3:6]
             tm = x[:, 6:7]
             ts = tm.mean(dim=(2, 3), keepdim=True)
-            c6 = torch.cat([i0, i1], 1)
             out = None
             if fparams and fparams[0] in ("x", "inputs", "inp", "frame"):
                 if "scale_list" in fparams and "timestep" in fparams:
-                    out = s.n(c6, ts, scale_list)
+                    out = s.n(x, ts, scale_list)
                 elif "timestep" in fparams:
-                    out = s.n(c6, ts)
+                    out = s.n(x, ts)
                 else:
-                    out = s.n(c6)
+                    out = s.n(x)
             elif fparams and fparams[0] in ("img0", "x0", "image0"):
                 if "scale_list" in fparams and "timestep" in fparams:
                     out = s.n(i0, i1, ts, scale_list)
@@ -151,8 +150,7 @@ def make_wrapper(net):
                     out = s.n(i0, i1)
             else:
                 last = None
-                for fn in (lambda: s.n(c6, ts, scale_list), lambda: s.n(c6, ts), lambda: s.n(c6),
-                           lambda: s.n(x, ts, scale_list), lambda: s.n(x, ts), lambda: s.n(x),
+                for fn in (lambda: s.n(x, ts, scale_list), lambda: s.n(x, ts), lambda: s.n(x),
                            lambda: s.n(i0, i1, ts, scale_list), lambda: s.n(i0, i1, ts), lambda: s.n(i0, i1)):
                     try:
                         out = fn()
