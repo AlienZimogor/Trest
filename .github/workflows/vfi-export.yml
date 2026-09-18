@@ -27,7 +27,42 @@ jobs:
           unzip -o model.zip -d model_src
           find model_src -type f | head -50
       - name: export
-        run: python export_rife.py
+        run: |
+          python - <<'PY'
+          import sys, os, glob, importlib.util
+          import torch, torch.nn as nn
+          pys = [p for p in glob.glob("model_src/**/*.py", recursive=True)
+                 if "class IFNet" in open(p, encoding="utf-8", errors="ignore").read(200000)]
+          print("IFNet py:", pys)
+          spec = importlib.util.spec_from_file_location("prov_ifnet", pys[0])
+          m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+          pkls = glob.glob("model_src/**/*.pkl", recursive=True) + \
+                 glob.glob("model_src/**/*.pth", recursive=True) + \
+                 glob.glob("model_src/**/*.pt", recursive=True)
+          print("pkl:", pkls)
+          net = m.IFNet()
+          sd = torch.load(pkls[0], map_location="cpu", weights_only=False)
+          if isinstance(sd, dict) and "state_dict" in sd: sd = sd["state_dict"]
+          miss, unexp = net.load_state_dict(sd, strict=False)
+          print("MISSING:", list(miss)[:20]); print("UNEXPECTED:", list(unexp)[:20])
+          net.eval()
+          class W(nn.Module):
+              def __init__(s, n): super().__init__(); s.n = n
+              def forward(s, x):
+                  t = x[:, 6:7].mean(dim=(2, 3), keepdim=True)
+                  try: return s.n(x[:, 0:3], x[:, 3:6], timestep=t)
+                  except TypeError: return s.n(x[:, 0:3], x[:, 3:6], t)
+          w = W(net)
+          dummy = torch.randn(1, 7, 288, 512)
+          with torch.no_grad():
+              ref = w(dummy)
+          print("REF out %s mean=%.4f min=%.4f max=%.4f" %
+                (tuple(ref.shape), ref.mean(), ref.min(), ref.max()))
+          torch.onnx.export(w, dummy, "rife_clean.onnx", opset_version=13,
+                            input_names=["in0"], output_names=["out0"],
+                            do_constant_folding=True)
+          print("EXPORT OK")
+          PY
       - name: pnnx
         run: |
           python -m pip install -q pnnx
