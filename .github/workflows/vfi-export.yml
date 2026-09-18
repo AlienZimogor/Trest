@@ -1,0 +1,39 @@
+name: vfi-export
+on: [workflow_dispatch]
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: deps
+        run: |
+          python -m pip install -q numpy onnx
+          python -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+      - name: rife-src
+        run: git clone --depth 1 https://github.com/hzwer/Practical-RIFE.git
+      - name: pkl
+        run: |
+          if [ ! -f rife_v4.26.pkl ]; then
+            curl -sL -o rife_v4.26.pkl \
+              "https://github.com/${GITHUB_REPOSITORY}/releases/download/v426/rife_v4.26.pkl"
+          fi
+          ls -la rife_v4.26.pkl
+      - name: export
+        run: python export_rife.py rife_v4.26.pkl
+      - name: pnnx
+        run: |
+          python -m pip install -q pnnx
+          pnnx rife_clean.onnx inputshape=[1,7,288,512]
+          echo "=== PARAM HEAD ==="
+          head -40 rife_clean.ncnn.param
+          echo "=== LAYER TYPES ==="
+          awk 'NR>2 {print $1}' rife_clean.ncnn.param | sort | uniq -c | sort -rn
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rife-clean
+          path: |
+            rife_clean.ncnn.param
+            rife_clean.ncnn.bin
