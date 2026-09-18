@@ -1,4 +1,4 @@
-import sys, os, glob, types, importlib.util
+import sys, os, glob, types, inspect, importlib.util, subprocess, shutil, zipfile
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -24,10 +24,10 @@ def _warp(x, flow):
 model_pkg = types.ModuleType("model")
 model_pkg.__path__ = []
 sys.modules.setdefault("model", model_pkg)
-wp_stub = types.ModuleType("model.warplayer")
-wp_stub.warp = _warp
-sys.modules.setdefault("model.warplayer", wp_stub)
-setattr(model_pkg, "warplayer", wp_stub)
+wp = types.ModuleType("model.warplayer")
+wp.warp = _warp
+sys.modules.setdefault("model.warplayer", wp)
+setattr(model_pkg, "warplayer", wp)
 
 
 def _load(path, name):
@@ -36,6 +36,16 @@ def _load(path, name):
     sys.modules[name] = m
     spec.loader.exec_module(m)
     return m
+
+
+# подтягиваем refine.py как model.refine, если RIFE_HDv3 его импортирует
+for d in sorted(glob.glob(os.path.join(ROOT, "**", "refine.py"), recursive=True)):
+    try:
+        rm = _load(d, "model.refine")
+        setattr(model_pkg, "refine", rm)
+        print("refine loaded from", d)
+    except Exception as e:
+        print("refine load fail:", e)
 
 
 def _pref(p):
@@ -53,21 +63,22 @@ def _pref(p):
 
 
 pys = [p for p in glob.glob(os.path.join(ROOT, "**", "*.py"), recursive=True)
-       if "__pycache__" not in p
-       and "class IFNet" in open(p, encoding="utf-8", errors="ignore").read(200000)]
+       if "__pycache__" not in p]
 pkls = [p for p in
         glob.glob(os.path.join(ROOT, "**", "*.pkl"), recursive=True) +
         glob.glob(os.path.join(ROOT, "**", "*.pth"), recursive=True) +
         glob.glob(os.path.join(ROOT, "**", "*.pt"), recursive=True)]
-pys.sort(key=_pref, reverse=True)
 pkls.sort(key=_pref, reverse=True)
-print("py candidates:", pys)
 print("pkl candidates:", pkls)
-if not pys or not pkls:
-    raise SystemExit("no IFNet py or weights found under " + ROOT)
+if not pkls:
+    raise SystemExit("no weights found")
+
+sd_raw = torch.load(pkls[0], map_location="cpu", weights_only=False)
+if isinstance(sd_raw, dict) and "state_dict" in sd_raw:
+    sd_raw = sd_raw["state_dict"]
 
 
-def strip_prefix(sd):
+def strip_mod(sd):
     out = {}
     for k, v in sd.items():
         k2 = k
@@ -77,98 +88,121 @@ def strip_prefix(sd):
     return out
 
 
-best = None
-for pi, py in enumerate(pys):
-    d = os.path.dirname(py)
-    ref = os.path.join(d, "refine.py")
-    if os.path.isfile(ref):
-        try:
-            rm = _load(ref, "model.refine")
-            setattr(model_pkg, "refine", rm)
-        except Exception as e:
-            print("refine load fail:", e)
-    wpr = os.path.join(d, "warplayer.py")
-    if os.path.isfile(wpr):
-        try:
-            wm = _load(wpr, "model.warplayer")
-            if not hasattr(wm, "warp"):
-                wm.warp = _warp
-            setattr(model_pkg, "warplayer", wm)
-        except Exception as e:
-            print("warplayer load fail, keep stub:", e)
-            sys.modules["model.warplayer"] = wp_stub
-            setattr(model_pkg, "warplayer", wp_stub)
+sd_base = strip_mod(sd_raw)
+
+TARGETS = [
+    ("ifnet", "IFNet_HDv3.py", ["IFNet"]),
+    ("rifehdv3", "RIFE_HDv3.py", ["Model", "RIFE", "RIFE_HDv3"]),
+]
+
+
+def find_py(base):
+    for p in pys:
+        if os.path.basename(p) == base:
+            return p
+    return None
+
+
+def make_wrapper(net):
+    fparams = list(inspect.signature(net.forward).parameters.keys())
+
+    class W(nn.Module):
+        def __init__(s):
+            super().__init__()
+            s.n = net
+
+        def forward(s, x):
+            i0 = x[:, 0:3]
+            i1 = x[:, 3:6]
+            tm = x[:, 6:7]
+            ts = tm.mean(dim=(2, 3), keepdim=True)
+            c6 = torch.cat([i0, i1], 1)
+            if fparams and fparams[0] in ("x", "inputs", "inp", "frame"):
+                if "timestep" in fparams:
+                    return s.n(c6, ts)
+                return s.n(c6)
+            if fparams and fparams[0] in ("img0", "x0", "image0"):
+                if "timestep" in fparams:
+                    return s.n(i0, i1, ts)
+                return s.n(i0, i1)
+            last = None
+            for fn in (lambda: s.n(c6, ts), lambda: s.n(c6),
+                       lambda: s.n(x, ts), lambda: s.n(x),
+                       lambda: s.n(i0, i1, ts), lambda: s.n(i0, i1)):
+                try:
+                    return fn()
+                except Exception as e:
+                    last = e
+            raise last
+    return W(), fparams
+
+
+produced = []
+for set_name, py_base, class_names in TARGETS:
+    py = find_py(py_base)
+    if py is None:
+        print("SET %s: SKIP (py %s not found)" % (set_name, py_base))
+        continue
     try:
-        mod = _load(py, "prov_ifnet_%d" % pi)
+        mod = _load(py, "prov_%s" % set_name)
     except Exception as e:
-        print("skip py:", py, "->", e)
+        print("SET %s: SKIP (import fail %s)" % (set_name, e))
         continue
-    cls = getattr(mod, "IFNet", None)
+    cls = None
+    for cn in class_names:
+        if hasattr(mod, cn):
+            cls = getattr(mod, cn)
+            break
     if cls is None:
-        print("no class IFNet in", py)
+        print("SET %s: SKIP (no class %s)" % (set_name, class_names))
         continue
-    for pkl in pkls:
-        try:
-            sd = torch.load(pkl, map_location="cpu", weights_only=False)
-        except Exception as e:
-            print("skip pkl:", pkl, "->", e)
-            continue
-        if isinstance(sd, dict) and "state_dict" in sd:
-            sd = sd["state_dict"]
-        sd = strip_prefix(sd)
-        try:
-            probe = cls()
-        except Exception as e:
-            print("init fail for", py, "->", e)
+    net = cls()
+    best_map, best_miss = None, None
+    for map_name, sd in (("direct", sd_base),
+                         ("flownet.", {"flownet." + k: v for k, v in sd_base.items()})):
+        miss, unexp = net.load_state_dict(sd, strict=False)
+        print("SET %s map=%s missing=%d unexpected=%d" %
+              (set_name, map_name, len(miss), len(unexp)))
+        if best_miss is None or len(miss) < best_miss:
+            best_map, best_miss = map_name, len(miss)
+        if len(miss) == 0:
             break
-        miss, unexp = probe.load_state_dict(sd, strict=False)
-        bad = len(miss) + len(unexp)
-        print("pair %s + %s -> missing=%d unexpected=%d" %
-              (os.path.basename(py), os.path.basename(pkl), len(miss), len(unexp)))
-        if best is None or bad < best[0]:
-            best = (bad, py, pkl, cls, sd)
-        if bad == 0:
-            break
-    if best is not None and best[0] == 0:
-        break
+    if best_miss != 0:
+        print("SET %s: SKIP (missing=%d with map=%s; weights incomplete)" %
+              (set_name, best_miss, best_map))
+        continue
+    net.load_state_dict(
+        sd_base if best_map == "direct"
+        else {"flownet." + k: v for k, v in sd_base.items()},
+        strict=False)
+    net.eval()
+    w, fparams = make_wrapper(net)
+    print("SET %s: forward params %s" % (set_name, fparams))
+    onnx_path = "rife_%s.onnx" % set_name
+    dummy = torch.randn(1, 7, 288, 512)
+    with torch.no_grad():
+        ref = w(dummy)
+    print("SET %s REF out %s mean=%.4f min=%.4f max=%.4f" %
+          (set_name, tuple(ref.shape), ref.mean(), ref.min(), ref.max()))
+    torch.onnx.export(w, dummy, onnx_path, opset_version=13,
+                      input_names=["in0"], output_names=["out0"],
+                      do_constant_folding=True)
+    pnnx = shutil.which("pnnx") or "pnnx"
+    r = subprocess.run([pnnx, onnx_path, "inputshape=[1,7,288,512]"],
+                       capture_output=True, text=True)
+    print("SET %s pnnx rc=%d" % (set_name, r.returncode))
+    if r.returncode != 0:
+        print(r.stdout[-2000:], r.stderr[-2000:])
+        continue
+    produced.append(set_name)
 
-if best is None:
-    raise SystemExit("no usable arch/weights pair")
-bad, py, pkl, cls, sd = best
-print("CHOSEN arch=%s weights=%s mismatch=%d" % (py, pkl, bad))
-if bad != 0:
-    print("WARNING: mismatch>0, output may be garbage")
-
-net = cls()
-net.load_state_dict(sd, strict=False)
-net.eval()
-
-
-class W(nn.Module):
-    def __init__(s, n):
-        super().__init__()
-        s.n = n
-
-    def forward(s, x):
-        t = x[:, 6:7].mean(dim=(2, 3), keepdim=True)
-        try:
-            return s.n(x[:, 0:3], x[:, 3:6], timestep=t)
-        except TypeError:
-            pass
-        try:
-            return s.n(x[:, 0:3], x[:, 3:6], t)
-        except TypeError:
-            pass
-        return s.n(x)
-
-
-w = W(net)
-dummy = torch.randn(1, 7, 288, 512)
-with torch.no_grad():
-    ref = w(dummy)
-print("REF out %s mean=%.4f min=%.4f max=%.4f" %
-      (tuple(ref.shape), ref.mean(), ref.min(), ref.max()))
-torch.onnx.export(w, dummy, "rife_clean.onnx", opset_version=13,
-                  input_names=["in0"], output_names=["out0"],
-                  do_constant_folding=True)
-print("EXPORT OK")
+print("PRODUCED SETS:", produced)
+if not produced:
+    raise SystemExit("no sets produced")
+with zipfile.ZipFile("rife_models.zip", "w", zipfile.ZIP_DEFLATED) as z:
+    for s in produced:
+        for ext in ("param", "bin"):
+            f = "rife_%s.ncnn.%s" % (s, ext)
+            if os.path.isfile(f):
+                z.write(f, os.path.join(s, os.path.basename(f)))
+print("ZIP OK")
