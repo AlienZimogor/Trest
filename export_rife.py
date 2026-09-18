@@ -21,77 +21,126 @@ def _warp(x, flow):
     return F.grid_sample(x, vgrid, align_corners=True)
 
 
-_wp = types.ModuleType("model.warplayer")
-_wp.warp = _warp
-_mpkg = types.ModuleType("model")
-_mpkg.warplayer = _wp
-if not os.path.isdir(os.path.join(ROOT, "model")):
-    sys.modules.setdefault("model", _mpkg)
-    sys.modules.setdefault("model.warplayer", _wp)
+model_pkg = types.ModuleType("model")
+model_pkg.__path__ = []
+sys.modules.setdefault("model", model_pkg)
+wp_stub = types.ModuleType("model.warplayer")
+wp_stub.warp = _warp
+sys.modules.setdefault("model.warplayer", wp_stub)
+setattr(model_pkg, "warplayer", wp_stub)
 
 
-def _load_mod(path):
-    name = "prov_" + os.path.basename(path)[:-3]
+def _load(path, name):
     spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    m = importlib.util.module_from_spec(spec)
+    sys.modules[name] = m
+    spec.loader.exec_module(m)
+    return m
 
 
-def score(p):
+def _pref(p):
     s = 0
-    if "4.26" in p or "v4" in p:
-        s += 2
-    if "HDv3" in p:
-        s -= 1
+    b = os.path.basename(p).lower()
+    if "4.26" in b or "426" in b:
+        s += 4
+    if "v4" in b:
+        s += 1
+    if "flownet" in b:
+        s -= 3
+    if "__pycache__" in p:
+        s -= 10
     return s
 
 
 pys = [p for p in glob.glob(os.path.join(ROOT, "**", "*.py"), recursive=True)
-       if "class IFNet" in open(p, encoding="utf-8", errors="ignore").read(200000)]
-pys.sort(key=score, reverse=True)
-print("IFNet py candidates:", pys)
-if not pys:
-    raise SystemExit("no IFNet py found")
-
-pkls = (glob.glob(os.path.join(ROOT, "**", "*.pkl"), recursive=True) +
+       if "__pycache__" not in p
+       and "class IFNet" in open(p, encoding="utf-8", errors="ignore").read(200000)]
+pkls = [p for p in
+        glob.glob(os.path.join(ROOT, "**", "*.pkl"), recursive=True) +
         glob.glob(os.path.join(ROOT, "**", "*.pth"), recursive=True) +
-        glob.glob(os.path.join(ROOT, "**", "*.pt"), recursive=True))
-print("weights:", pkls)
-if not pkls:
-    raise SystemExit("no weights found")
-sd = torch.load(pkls[0], map_location="cpu", weights_only=False)
-if isinstance(sd, dict) and "state_dict" in sd:
-    sd = sd["state_dict"]
-print("sd keys sample:", list(sd.keys())[:8])
+        glob.glob(os.path.join(ROOT, "**", "*.pt"), recursive=True)]
+pys.sort(key=_pref, reverse=True)
+pkls.sort(key=_pref, reverse=True)
+print("py candidates:", pys)
+print("pkl candidates:", pkls)
+if not pys or not pkls:
+    raise SystemExit("no IFNet py or weights found under " + ROOT)
 
-chosen_net = None
-chosen_path = None
-for p in pys:
+
+def strip_prefix(sd):
+    out = {}
+    for k, v in sd.items():
+        k2 = k
+        while k2.startswith("module."):
+            k2 = k2[len("module."):]
+        out[k2] = v
+    return out
+
+
+best = None
+for pi, py in enumerate(pys):
+    d = os.path.dirname(py)
+    ref = os.path.join(d, "refine.py")
+    if os.path.isfile(ref):
+        try:
+            rm = _load(ref, "model.refine")
+            setattr(model_pkg, "refine", rm)
+        except Exception as e:
+            print("refine load fail:", e)
+    wpr = os.path.join(d, "warplayer.py")
+    if os.path.isfile(wpr):
+        try:
+            wm = _load(wpr, "model.warplayer")
+            if not hasattr(wm, "warp"):
+                wm.warp = _warp
+            setattr(model_pkg, "warplayer", wm)
+        except Exception as e:
+            print("warplayer load fail, keep stub:", e)
+            sys.modules["model.warplayer"] = wp_stub
+            setattr(model_pkg, "warplayer", wp_stub)
     try:
-        mod = _load_mod(p)
+        mod = _load(py, "prov_ifnet_%d" % pi)
     except Exception as e:
-        print("skip", p, "->", e)
+        print("skip py:", py, "->", e)
         continue
     cls = getattr(mod, "IFNet", None)
     if cls is None:
+        print("no class IFNet in", py)
         continue
-    try:
-        net = cls()
-    except Exception as e:
-        print("skip init", p, "->", e)
-        continue
-    miss, unexp = net.load_state_dict(sd, strict=False)
-    print("arch", p, "missing", len(miss), "unexpected", len(unexp))
-    if len(miss) == 0 and len(unexp) == 0:
-        chosen_net, chosen_path = net, p
+    for pkl in pkls:
+        try:
+            sd = torch.load(pkl, map_location="cpu", weights_only=False)
+        except Exception as e:
+            print("skip pkl:", pkl, "->", e)
+            continue
+        if isinstance(sd, dict) and "state_dict" in sd:
+            sd = sd["state_dict"]
+        sd = strip_prefix(sd)
+        try:
+            probe = cls()
+        except Exception as e:
+            print("init fail for", py, "->", e)
+            break
+        miss, unexp = probe.load_state_dict(sd, strict=False)
+        bad = len(miss) + len(unexp)
+        print("pair %s + %s -> missing=%d unexpected=%d" %
+              (os.path.basename(py), os.path.basename(pkl), len(miss), len(unexp)))
+        if best is None or bad < best[0]:
+            best = (bad, py, pkl, cls, sd)
+        if bad == 0:
+            break
+    if best is not None and best[0] == 0:
         break
-    if chosen_net is None:
-        chosen_net, chosen_path = net, p
-if chosen_net is None:
-    raise SystemExit("no usable IFNet arch")
-print("CHOSEN arch:", chosen_path)
-net = chosen_net
+
+if best is None:
+    raise SystemExit("no usable arch/weights pair")
+bad, py, pkl, cls, sd = best
+print("CHOSEN arch=%s weights=%s mismatch=%d" % (py, pkl, bad))
+if bad != 0:
+    print("WARNING: mismatch>0, output may be garbage")
+
+net = cls()
+net.load_state_dict(sd, strict=False)
 net.eval()
 
 
