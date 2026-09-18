@@ -166,8 +166,47 @@ public:
     }
 };
 
+class Slice_fix : public ncnn::Layer {
+public:
+    ncnn::Mat slices;
+    int axis;
+    Slice_fix() {
+        axis = 0;
+        support_vulkan = false;
+        support_fp16_storage = false;
+        support_packing = false;
+    }
+    virtual int load_param(const ncnn::ParamDict& pd) {
+        slices = pd.get(0, ncnn::Mat());
+        axis = pd.get(1, 0);
+        return 0;
+    }
+    virtual int forward(const std::vector<ncnn::Mat>& bb,
+                        std::vector<ncnn::Mat>& tb,
+                        const ncnn::Option& opt) const {
+        const ncnn::Mat& b = bb[0];
+        const int C = b.c;
+        const int n = (int)tb.size();
+        int off = 0;
+        for (int i = 0; i < n; i++) {
+            int want = (i < slices.w) ? (int)slices[i] : (C - off);
+            int take = (i == n - 1) ? (C - off) : std::min(want, C - off);
+            if (take <= 0) { tb[i] = ncnn::Mat(); continue; }
+            ncnn::Mat& t = tb[i];
+            t.create(b.w, b.h, take, b.elemsize, b.elempack, opt.blob_allocator);
+            if (t.empty()) return -100;
+            for (int c = 0; c < take; c++)
+                memcpy(t.channel(c), b.channel(off + c),
+                       (size_t)b.w * b.h * b.elemsize);
+            off += take;
+        }
+        return 0;
+    }
+};
+
 static ncnn::Layer* Reshape_fix_creator(void*) { return new Reshape_fix; }
 static ncnn::Layer* GridSample_fix_creator(void*) { return new GridSample_fix; }
+static ncnn::Layer* Slice_fix_creator(void*) { return new Slice_fix; }
 
 static const char* warp_glsl = R"GLSL(
 #version 450
@@ -329,6 +368,7 @@ static ncnn::Layer* Warp_layer_creator(void*) { return new Warp_layer; }
 static void register_all(ncnn::Net& net) {
     net.register_custom_layer(ncnn::layer_to_index("Reshape"), Reshape_fix_creator);
     net.register_custom_layer(ncnn::layer_to_index("GridSample"), GridSample_fix_creator);
+    net.register_custom_layer(ncnn::layer_to_index("Slice"), Slice_fix_creator);
     net.register_custom_layer("rife.Warp", Warp_layer_creator);
 }
 
