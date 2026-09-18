@@ -316,8 +316,6 @@ public:
 static ncnn::Layer* Warp_layer_creator(void*) { return new Warp_layer; }
 
 static void register_all(ncnn::Net& net) {
-    net.register_custom_layer(ncnn::layer_to_index("Reshape"), Reshape_fix_creator);
-    net.register_custom_layer(ncnn::layer_to_index("GridSample"), GridSample_fix_creator);
     net.register_custom_layer("rife.Warp", Warp_layer_creator);
 }
 
