@@ -21,6 +21,7 @@ static double now_ms() {
 }
 
 static bool g_warp_gpu = false;
+static int g_reshmode = 1;
 
 static std::atomic<int> g_frame{0};
 static std::atomic<int> g_frames{0};
@@ -40,7 +41,7 @@ static void start_heartbeat() {
 }
 
 static void parse_opt(const char* e, int& threads, bool& fp16) {
-    threads = 4; fp16 = false;
+    threads = 8; fp16 = false;
     if (!e) return;
     std::string s(e);
     size_t pos = 0;
@@ -49,6 +50,7 @@ static void parse_opt(const char* e, int& threads, bool& fp16) {
         std::string tok = s.substr(pos,
             col == std::string::npos ? std::string::npos : col - pos);
         if (tok == "thr=1") threads = 1;
+        else if (tok == "thr=4") threads = 4;
         else if (tok == "fp16=1") fp16 = true;
         if (col == std::string::npos) break;
         pos = col + 1;
@@ -78,6 +80,15 @@ public:
         const int total = (int)b.total();
         int tw = w > 0 ? w : b.w;
         int th = h > 0 ? h : b.h;
+        if (g_reshmode == 1 && c11 > 0 && tw == b.w && th == b.h && c11 <= b.c) {
+            ncnn::Mat& top = tb[0];
+            top.create(tw, th, c11, b.elemsize, b.elempack, opt.blob_allocator);
+            if (top.empty()) return -100;
+            for (int c = 0; c < c11; c++)
+                memcpy(top.channel(c), b.channel(c),
+                       (size_t)tw * th * b.elemsize);
+            return 0;
+        }
         int tc = 0;
         if (tw > 0 && th > 0 && total % (tw * th) == 0) tc = total / (tw * th);
         if (tc == 0) {
@@ -96,6 +107,44 @@ public:
         top.create(tw, th, tc, b.elemsize, b.elempack, opt.blob_allocator);
         if (top.empty()) return -100;
         memcpy(top.data, b.data, (size_t)total * b.elemsize);
+        return 0;
+    }
+};
+
+class Slice_fix : public ncnn::Layer {
+public:
+    ncnn::Mat slices;
+    int axis;
+    Slice_fix() {
+        axis = 0;
+        support_vulkan = false;
+        support_fp16_storage = false;
+        support_packing = false;
+    }
+    virtual int load_param(const ncnn::ParamDict& pd) {
+        slices = pd.get(0, ncnn::Mat());
+        axis = pd.get(1, 0);
+        return 0;
+    }
+    virtual int forward(const std::vector<ncnn::Mat>& bb,
+                        std::vector<ncnn::Mat>& tb,
+                        const ncnn::Option& opt) const {
+        const ncnn::Mat& b = bb[0];
+        const int C = b.c;
+        const int n = (int)tb.size();
+        int off = 0;
+        for (int i = 0; i < n; i++) {
+            int want = (i < slices.w) ? (int)slices[i] : (C - off);
+            int take = (i == n - 1) ? (C - off) : std::min(want, C - off);
+            if (take <= 0) { tb[i] = ncnn::Mat(); continue; }
+            ncnn::Mat& t = tb[i];
+            t.create(b.w, b.h, take, b.elemsize, b.elempack, opt.blob_allocator);
+            if (t.empty()) return -100;
+            for (int c = 0; c < take; c++)
+                memcpy(t.channel(c), b.channel(off + c),
+                       (size_t)b.w * b.h * b.elemsize);
+            off += take;
+        }
         return 0;
     }
 };
@@ -167,6 +216,7 @@ public:
 };
 
 static ncnn::Layer* Reshape_fix_creator(void*) { return new Reshape_fix; }
+static ncnn::Layer* Slice_fix_creator(void*) { return new Slice_fix; }
 static ncnn::Layer* GridSample_fix_creator(void*) { return new GridSample_fix; }
 
 static const char* warp_glsl = R"GLSL(
@@ -214,58 +264,24 @@ public:
         if (!opt.use_vulkan_compute || !support_vulkan) return 0;
         std::vector<uint32_t> spirv;
         int ret = ncnn::compile_spirv_module(warp_glsl, (int)strlen(warp_glsl), opt, spirv);
-        if (ret != 0) {
-            fprintf(stderr, "WARP_VULKAN_OFF compile=%d\n", ret);
-            support_vulkan = false;
-            return 0;
-        }
+        if (ret != 0) { support_vulkan = false; return 0; }
         pipeline = new ncnn::Pipeline(ncnn::get_gpu_device(0));
         pipeline->set_optimal_local_size_xyz(8, 8, 1);
         ret = pipeline->create(spirv.data(), spirv.size() * 4,
                                std::vector<ncnn::vk_specialization_type>());
         if (ret != 0) {
-            fprintf(stderr, "WARP_VULKAN_OFF create=%d\n", ret);
             support_vulkan = false;
-            delete pipeline;
-            pipeline = 0;
+            delete pipeline; pipeline = 0;
             return 0;
         }
         fprintf(stderr, "WARP_VULKAN_ON\n");
         return 0;
     }
     virtual int destroy_pipeline(const ncnn::Option& opt) {
-        delete pipeline;
-        pipeline = 0;
-        return 0;
+        delete pipeline; pipeline = 0; return 0;
     }
-    virtual int forward_gpu(const std::vector<ncnn::VkMat>& bottom_blobs,
-                            std::vector<ncnn::VkMat>& top_blobs,
-                            ncnn::VkCompute& cmd,
-                            const ncnn::Option& opt) const {
-        const ncnn::VkMat& x = bottom_blobs[0];
-        const ncnn::VkMat& flow = bottom_blobs[1];
-        const int w = x.w, h = x.h, ch = x.c;
-        if (flow.c != 2 || flow.w < w || flow.h < h) return -100;
-        if (x.elemsize != 4u || flow.elemsize != 4u ||
-            x.elempack != 1 || flow.elempack != 1) return -101;
-        ncnn::VkMat& top = top_blobs[0];
-        top.create(w, h, ch, 4u, 1, opt.blob_vkallocator);
-        if (top.empty()) return -100;
-        std::vector<ncnn::VkMat> bindings(3);
-        bindings[0] = x;
-        bindings[1] = flow;
-        bindings[2] = top;
-        std::vector<ncnn::vk_constant_type> k(7);
-        k[0].i = w;
-        k[1].i = h;
-        k[2].i = flow.w;
-        k[3].i = flow.h;
-        k[4].i = (flow.w - w) / 2;
-        k[5].i = (flow.h - h) / 2;
-        k[6].i = ch;
-        cmd.record_pipeline(pipeline, bindings, k, top);
-        return 0;
-    }
+    virtual int forward_gpu(const std::vector<ncnn::VkMat>&, std::vector<ncnn::VkMat>&,
+                            ncnn::VkCompute&, const ncnn::Option&) const { return -100; }
     virtual int forward(const std::vector<ncnn::Mat>& bottom_blobs,
                         std::vector<ncnn::Mat>& top_blobs,
                         const ncnn::Option& opt) const {
@@ -273,8 +289,6 @@ public:
         const ncnn::Mat& flow = bottom_blobs[1];
         const int w = x.w, h = x.h, ch = x.c;
         if (flow.c != 2 || flow.w < w || flow.h < h) return -100;
-        if (x.elemsize != 4u || flow.elemsize != 4u ||
-            x.elempack != 1 || flow.elempack != 1) return -101;
         const int oy = (flow.h - h) / 2;
         const int ox = (flow.w - w) / 2;
         ncnn::Mat& top = top_blobs[0];
@@ -294,10 +308,7 @@ public:
                         const float sx = xi + f0[fy_row + xi];
                         const float sy = y  + f1[fy_row + xi];
                         if (sx < 0.f || sx > (float)(w - 1) ||
-                            sy < 0.f || sy > (float)(h - 1)) {
-                            tp[y * w + xi] = 0.f;
-                            continue;
-                        }
+                            sy < 0.f || sy > (float)(h - 1)) { tp[y*w+xi] = 0.f; continue; }
                         const int x0 = (int)sx, y0i = (int)sy;
                         const int x1 = std::min(x0 + 1, w - 1);
                         const int y1i = std::min(y0i + 1, h - 1);
@@ -314,8 +325,7 @@ public:
         const int per = (h + nthreads - 1) / nthreads;
         std::vector<std::thread> ths;
         for (int t = 1; t < nthreads; t++) {
-            int y0 = t * per;
-            int y1 = std::min(h, y0 + per);
+            int y0 = t * per, y1 = std::min(h, y0 + per);
             if (y0 < y1) ths.push_back(std::thread(body, y0, y1));
         }
         body(0, std::min(h, per));
@@ -328,8 +338,112 @@ static ncnn::Layer* Warp_layer_creator(void*) { return new Warp_layer; }
 
 static void register_all(ncnn::Net& net) {
     net.register_custom_layer(ncnn::layer_to_index("Reshape"), Reshape_fix_creator);
+    net.register_custom_layer(ncnn::layer_to_index("Slice"), Slice_fix_creator);
     net.register_custom_layer(ncnn::layer_to_index("GridSample"), GridSample_fix_creator);
     net.register_custom_layer("rife.Warp", Warp_layer_creator);
+}
+
+static int run_net(bool warp_gpu, bool use_vulkan,
+                   const char* param, const char* bin,
+                   int W, int H, int runs, const char* label) {
+    g_warp_gpu = warp_gpu;
+    int threads; bool fp16;
+    parse_opt(getenv("VFI_OPT"), threads, fp16);
+    printf("opt: thr=%d fp16=%d vulkan=%d reshmode=%d\n",
+           threads, fp16 ? 1 : 0, use_vulkan ? 1 : 0, g_reshmode);
+    ncnn::Net net;
+    net.opt.use_vulkan_compute = use_vulkan;
+    if (use_vulkan) net.set_vulkan_device(0);
+    net.opt.use_fp16_packed = fp16;
+    net.opt.use_fp16_storage = fp16;
+    net.opt.use_fp16_arithmetic = false;
+    net.opt.use_packing_layout = false;
+    net.opt.num_threads = threads;
+    register_all(net);
+    g_phase = "load";
+    if (net.load_param(param) != 0) { fprintf(stderr, "ERR: load_param failed\n"); fflush(NULL); return 2; }
+    if (net.load_model(bin) != 0) { fprintf(stderr, "ERR: load_model failed\n"); fflush(NULL); return 2; }
+    ncnn::Mat a(W, H, 3), b(W, H, 3);
+    for (int c = 0; c < 3; c++) {
+        float* pa = a.channel(c); float* pb = b.channel(c);
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+            pa[y*W+x] = fmodf((x + c * 37.0f) / 255.0f, 1.0f);
+            pb[y*W+x] = fmodf((x + y + c * 37.0f) / 255.0f, 1.0f);
+        }
+    }
+    ncnn::Mat ts(1, 1, 1); ts.channel(0)[0] = 0.5f;
+    const std::vector<int>& ins = net.input_indexes();
+    printf("inputs=%d\n", (int)ins.size());
+    auto make_input = [&](int ci) {
+        ncnn::Mat in(W, H, ci);
+        for (int c = 0; c < ci; c++) {
+            float* p = in.channel(c);
+            if (c < 3) memcpy(p, a.channel(c), (size_t)W * H * 4);
+            else if (c < 6) memcpy(p, b.channel(c - 3), (size_t)W * H * 4);
+            else if (c == 6) { for (int i = 0; i < W * H; i++) p[i] = 0.5f; }
+            else memset(p, 0, (size_t)W * H * 4);
+        }
+        return in;
+    };
+    g_phase = "probe";
+    int c_in = 0;
+    if ((int)ins.size() == 1) {
+        const int cands[4] = {7, 6, 11, 4};
+        for (int k = 0; k < 4; k++) {
+            pid_t pid = fork();
+            if (pid == 0) {
+                ncnn::Extractor ex2 = net.create_extractor();
+                ex2.input(ins[0], make_input(cands[k]));
+                ncnn::Mat o;
+                int r = ex2.extract(net.output_indexes()[0], o);
+                fflush(NULL);
+                _exit(r == 0 ? 0 : 1);
+            }
+            int st = 0; waitpid(pid, &st, 0);
+            if (WIFEXITED(st) && WEXITSTATUS(st) == 0) { c_in = cands[k]; break; }
+        }
+        if (c_in == 0) { fprintf(stderr, "ERR: no feed contract worked\n"); fflush(NULL); return 3; }
+        printf("single-input contract c_in=%d\n", c_in);
+    }
+    auto feed = [&](ncnn::Extractor& ex) {
+        if ((int)ins.size() >= 2) {
+            ex.input(ins[0], a); ex.input(ins[1], b);
+            if ((int)ins.size() >= 3) ex.input(ins[2], ts);
+        } else {
+            ex.input(ins[0], make_input(c_in));
+        }
+    };
+    g_phase = "extract";
+    ncnn::Mat out;
+    {
+        ncnn::Extractor ex = net.create_extractor();
+        feed(ex);
+        int ret = ex.extract(net.output_indexes()[0], out);
+        if (ret != 0) { fprintf(stderr, "EXTRACT_RET=%d (%s)\n", ret, label); fflush(NULL); return 3; }
+    }
+    double mn = 1e9, mx = -1e9, sum = 0;
+    int n = out.w * out.h * out.c;
+    const float* p = out;
+    for (int i = 0; i < n; i++) { double v = p[i]; if (v < mn) mn = v; if (v > mx) mx = v; sum += v; }
+    printf("out w=%d h=%d c=%d min=%.3f max=%.3f mean=%.3f (%s)\n",
+           out.w, out.h, out.c, mn, mx, sum / n, label);
+    if (!(sum == sum)) fprintf(stderr, "WARN: NaN in output (%s)\n", label);
+    g_phase = "timing";
+    g_frames = runs;
+    double t0 = now_ms();
+    for (int r = 0; r < runs; r++) {
+        g_frame = r + 1;
+        printf("FRAME %d/%d\n", r + 1, runs);
+        fflush(NULL);
+        ncnn::Extractor e2 = net.create_extractor();
+        feed(e2);
+        ncnn::Mat o2;
+        e2.extract(net.output_indexes()[0], o2);
+    }
+    double dt = now_ms() - t0;
+    printf("time: %d runs, %.1f ms/run => %.2f fps at %dx%d (%s)\n",
+           runs, dt / runs, runs * 1000.0 / dt, W, H, label);
+    return 0;
 }
 
 static int bisect(const char* param, const char* bin, int W, int H) {
@@ -345,17 +459,11 @@ static int bisect(const char* param, const char* bin, int W, int H) {
     net.opt.num_threads = threads;
     register_all(net);
     g_phase = "load";
-    if (net.load_param(param) != 0) {
-        fprintf(stderr, "ERR: load_param failed in bisect\n"); fflush(NULL);
-        return 2;
-    }
-    if (net.load_model(bin) != 0) {
-        fprintf(stderr, "ERR: load_model failed in bisect\n"); fflush(NULL);
-        return 2;
-    }
+    if (net.load_param(param) != 0) { fprintf(stderr, "ERR: load_param failed in bisect\n"); fflush(NULL); return 2; }
+    if (net.load_model(bin) != 0) { fprintf(stderr, "ERR: load_model failed in bisect\n"); fflush(NULL); return 2; }
     const std::vector<ncnn::Layer*>& lrs = net.layers();
     const int n = (int)lrs.size();
-    printf("bisect: layers=%d (single-pass)\n", n);
+    printf("bisect: layers=%d (single-pass, reshmode=%d)\n", n, g_reshmode);
     fflush(NULL);
     ncnn::Mat in(W, H, 7);
     for (int c = 0; c < 7; c++) {
@@ -400,150 +508,38 @@ static int bisect(const char* param, const char* bin, int W, int H) {
     return 0;
 }
 
-static int run_net(bool warp_gpu, bool use_vulkan,
-                   const char* param, const char* bin,
-                   int W, int H, int runs, const char* label) {
-    g_warp_gpu = warp_gpu;
-    int threads; bool fp16;
-    parse_opt(getenv("VFI_OPT"), threads, fp16);
-    printf("opt: thr=%d fp16=%d\n", threads, fp16 ? 1 : 0);
-    ncnn::Net net;
-    net.opt.use_vulkan_compute = use_vulkan;
-    if (use_vulkan) net.set_vulkan_device(0);
-    net.opt.use_fp16_packed = fp16;
-    net.opt.use_fp16_storage = fp16;
-    net.opt.use_fp16_arithmetic = false;
-    net.opt.use_packing_layout = false;
-    net.opt.num_threads = threads;
-    register_all(net);
-    g_phase = "load";
-    if (net.load_param(param) != 0) {
-        fprintf(stderr, "ERR: load_param failed\n"); fflush(NULL);
-        return 2;
-    }
-    if (net.load_model(bin) != 0) {
-        fprintf(stderr, "ERR: load_model failed\n"); fflush(NULL);
-        return 2;
-    }
-    ncnn::Mat a(W, H, 3), b(W, H, 3);
-    for (int c = 0; c < 3; c++) {
-        float* pa = a.channel(c); float* pb = b.channel(c);
-        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
-            pa[y*W+x] = fmodf((x + c * 37.0f) / 255.0f, 1.0f);
-            pb[y*W+x] = fmodf((x + y + c * 37.0f) / 255.0f, 1.0f);
-        }
-    }
-    ncnn::Mat ts(1, 1, 1); ts.channel(0)[0] = 0.5f;
-    const std::vector<int>& ins = net.input_indexes();
-    printf("inputs=%d vulkan=%d\n", (int)ins.size(), use_vulkan ? 1 : 0);
-    auto make_input = [&](int ci) {
-        ncnn::Mat in(W, H, ci);
-        for (int c = 0; c < ci; c++) {
-            float* p = in.channel(c);
-            if (c < 3) memcpy(p, a.channel(c), (size_t)W * H * 4);
-            else if (c < 6) memcpy(p, b.channel(c - 3), (size_t)W * H * 4);
-            else if (c == 6) { for (int i = 0; i < W * H; i++) p[i] = 0.5f; }
-            else memset(p, 0, (size_t)W * H * 4);
-        }
-        return in;
-    };
-    g_phase = "probe";
-    int c_in = 0;
-    if ((int)ins.size() == 1) {
-        const int cands[4] = {7, 6, 11, 4};
-        for (int k = 0; k < 4; k++) {
-            pid_t pid = fork();
-            if (pid == 0) {
-                ncnn::Extractor ex2 = net.create_extractor();
-                ex2.input(ins[0], make_input(cands[k]));
-                ncnn::Mat o;
-                int r = ex2.extract(net.output_indexes()[0], o);
-                fflush(NULL);
-                _exit(r == 0 ? 0 : 1);
-            }
-            int st = 0; waitpid(pid, &st, 0);
-            if (WIFEXITED(st) && WEXITSTATUS(st) == 0) { c_in = cands[k]; break; }
-        }
-        if (c_in == 0) {
-            fprintf(stderr, "ERR: no feed contract worked\n"); fflush(NULL);
-            return 3;
-        }
-        printf("single-input contract c_in=%d\n", c_in);
-    }
-    auto feed = [&](ncnn::Extractor& ex) {
-        if ((int)ins.size() >= 2) {
-            ex.input(ins[0], a); ex.input(ins[1], b);
-            if ((int)ins.size() >= 3) ex.input(ins[2], ts);
-        } else {
-            ex.input(ins[0], make_input(c_in));
-        }
-    };
-    g_phase = "extract";
-    ncnn::Mat out;
-    {
-        ncnn::Extractor ex = net.create_extractor();
-        feed(ex);
-        int ret = ex.extract(net.output_indexes()[0], out);
-        if (ret != 0) {
-            fprintf(stderr, "EXTRACT_RET=%d (%s)\n", ret, label);
-            fflush(NULL);
-            return 3;
-        }
-    }
-    double mn = 1e9, mx = -1e9, sum = 0;
-    int n = out.w * out.h * out.c;
-    const float* p = out;
-    for (int i = 0; i < n; i++) { double v = p[i]; if (v < mn) mn = v; if (v > mx) mx = v; sum += v; }
-    printf("out w=%d h=%d c=%d min=%.3f max=%.3f mean=%.3f (%s)\n",
-           out.w, out.h, out.c, mn, mx, sum / n, label);
-    if (!(sum == sum)) {
-        fprintf(stderr, "WARN: NaN in output (%s)\n", label);
-    }
-    g_phase = "timing";
-    g_frames = runs;
-    double t0 = now_ms();
-    for (int r = 0; r < runs; r++) {
-        g_frame = r + 1;
-        printf("FRAME %d/%d\n", r + 1, runs);
-        fflush(NULL);
-        ncnn::Extractor e2 = net.create_extractor();
-        feed(e2);
-        ncnn::Mat o2;
-        e2.extract(net.output_indexes()[0], o2);
-    }
-    double dt = now_ms() - t0;
-    printf("time: %d runs, %.1f ms/run => %.2f fps at %dx%d (%s)\n",
-           runs, dt / runs, runs * 1000.0 / dt, W, H, label);
-    return 0;
-}
-
 int main(int argc, char** argv) {
     start_heartbeat();
     const char* param = argc > 1 ? argv[1] : "flownet.param";
     const char* bin   = argc > 2 ? argv[2] : "flownet.bin";
     int W = argc > 3 ? atoi(argv[3]) : 512;
-    int H = argc > 4 ? atoi(argv[4]) : 288;
+    int H = argc > 4 ? atoi(argv[4]) : 384;
     int runs = argc > 5 ? atoi(argv[5]) : 5;
     const char* mode = argc > 6 ? argv[6] : "gpu";
     if (strcmp(mode, "bisect") == 0) {
         return bisect(param, bin, W, H);
     }
+    if (strcmp(mode, "sweep") == 0) {
+        const int order[2] = {1, 0};
+        for (int k = 0; k < 2; k++) {
+            g_reshmode = order[k];
+            char lab[32];
+            snprintf(lab, sizeof(lab), "sweep%d", order[k]);
+            int rc = run_net(false, false, param, bin, W, H, runs, lab);
+            printf("SWEEP resmode=%d rc=%d\n", order[k], rc);
+            fflush(NULL);
+        }
+        return 0;
+    }
     if (strcmp(mode, "cpu") == 0) {
         return run_net(false, false, param, bin, W, H, runs, "cpu") == 0 ? 0 : 3;
     }
     if (strcmp(mode, "gpuw") == 0) {
-        if (ncnn::get_gpu_count() == 0) {
-            fprintf(stderr, "ERR: no vulkan gpu\n"); fflush(NULL); _exit(1);
-        }
+        if (ncnn::get_gpu_count() == 0) { fprintf(stderr, "ERR: no vulkan gpu\n"); fflush(NULL); _exit(1); }
         int rc = run_net(true, true, param, bin, W, H, runs, "gpuw");
-        if (rc != 0) {
-            fprintf(stderr, "GPUW_FAILED rc=%d\n", rc); fflush(NULL);
-            return 3;
-        }
+        if (rc != 0) { fprintf(stderr, "GPUW_FAILED rc=%d\n", rc); fflush(NULL); return 3; }
         return 0;
     }
-    if (ncnn::get_gpu_count() == 0) {
-        fprintf(stderr, "ERR: no vulkan gpu\n"); fflush(NULL); _exit(1);
-    }
+    if (ncnn::get_gpu_count() == 0) { fprintf(stderr, "ERR: no vulkan gpu\n"); fflush(NULL); _exit(1); }
     return run_net(false, true, param, bin, W, H, runs, "gpu") == 0 ? 0 : 3;
 }
