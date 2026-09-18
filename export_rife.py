@@ -9,6 +9,8 @@ ROOT = "model_src"
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+MIN_ONNX_BYTES = 8_000_000   # fp32 RIFE v4.26 ~24 MB; меньше = веса не встроены
+
 
 def _warp(x, flow):
     N, C, H, W = x.shape
@@ -365,15 +367,45 @@ for set_name, py_base, class_names in TARGETS:
 
     onnx_path = "rife_%s.onnx" % set_name
     try:
-        torch.onnx.export(w, DUMMY, onnx_path, opset_version=13,
-                          input_names=["in0"], output_names=["out0"],
-                          do_constant_folding=True)
-        print("  ONNX exported:", onnx_path, "(%.2f MB)" % (os.path.getsize(onnx_path)/1e6))
+        torch.onnx.export(
+            w, DUMMY, onnx_path,
+            opset_version=13,
+            input_names=["in0"],
+            output_names=["out0"],
+            do_constant_folding=True,
+            dynamo=False,
+        )
     except Exception as e:
         print("SKIP: onnx export fail ->", e)
         traceback.print_exc()
         continue
+    sz = os.path.getsize(onnx_path)
+    print("  ONNX exported:", onnx_path, "(%.2f MB)" % (sz / 1e6))
+    if sz < MIN_ONNX_BYTES:
+        print("SKIP: ONNX too small (%d B) — weights not embedded; abort set" % sz)
+        continue
     produced.append(set_name)
+
+# ===== pnnx ВНУТРИ скрипта, чтобы param/bin существовали до упаковки =====
+pnnx = shutil.which("pnnx") or "pnnx"
+for s in list(produced):
+    onnx_path = "rife_%s.onnx" % s
+    r = subprocess.run([pnnx, onnx_path, "inputshape=[1,7,384,512]"],
+                       capture_output=True, text=True)
+    print("pnnx[%s] rc=%d" % (s, r.returncode))
+    if r.returncode != 0:
+        print(r.stdout[-3000:])
+        print(r.stderr[-3000:])
+        produced.remove(s)
+        continue
+    for ext in ("param", "bin"):
+        f = "rife_%s.ncnn.%s" % (s, ext)
+        if os.path.isfile(f):
+            print("  pnnx out:", f, "(%.2f MB)" % (os.path.getsize(f)/1e6))
+        else:
+            print("  MISSING:", f)
+            if s in produced:
+                produced.remove(s)
 
 print("\n========== PACKING ==========")
 print("PRODUCED SETS:", produced)
@@ -385,5 +417,6 @@ with zipfile.ZipFile("rife_models.zip", "w", zipfile.ZIP_DEFLATED) as z:
             f = "rife_%s.ncnn.%s" % (s, ext)
             if os.path.isfile(f):
                 z.write(f, os.path.join(s, os.path.basename(f)))
-                print("  packed:", os.path.join(s, os.path.basename(f)))
+                print("  packed:", os.path.join(s, os.path.basename(f)),
+                      "(%.2f MB)" % (os.path.getsize(f)/1e6))
 print("ZIP OK: rife_models.zip (%.2f MB)" % (os.path.getsize("rife_models.zip")/1e6))
