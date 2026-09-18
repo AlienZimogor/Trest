@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-import sys, os, glob, types, inspect, importlib.util, subprocess, shutil, zipfile, traceback
+import sys, os, glob, types, inspect, importlib.util, importlib.machinery
+import subprocess, shutil, zipfile, traceback
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,15 +24,47 @@ def _warp(x, flow):
     return F.grid_sample(x, vgrid, align_corners=True, mode="bilinear", padding_mode="zeros")
 
 
+def _noop(*a, **k):
+    return None
+
+
+def _finish_module(mod, name, is_package=True):
+    spec = importlib.machinery.ModuleSpec(name, loader=None, is_package=is_package)
+    spec.origin = "<stub>"
+    mod.__spec__ = spec
+    mod.__file__ = "<stub:%s>" % name
+    mod.__loader__ = None
+    if is_package:
+        mod.__path__ = []
+    mod.__all__ = []
+    return mod
+
+
+def _make_stub(name):
+    mod = types.ModuleType(name)
+    _finish_module(mod, name, is_package=True)
+
+    def _getattr(attr):
+        if attr.startswith("_"):
+            raise AttributeError(attr)
+        return _noop
+    mod.__getattr__ = _getattr
+    sys.modules[name] = mod
+    return mod
+
+
 model_pkg = types.ModuleType("model")
-model_pkg.__path__ = []
+_finish_module(model_pkg, "model")
 sys.modules.setdefault("model", model_pkg)
+
 wp_stub = types.ModuleType("model.warplayer")
+_finish_module(wp_stub, "model.warplayer", is_package=False)
 wp_stub.warp = _warp
 sys.modules.setdefault("model.warplayer", wp_stub)
 setattr(model_pkg, "warplayer", wp_stub)
 
 tl_pkg = types.ModuleType("train_log")
+_finish_module(tl_pkg, "train_log")
 tl_pkg.__path__ = sorted(set(
     os.path.dirname(p) for p in glob.glob(os.path.join(ROOT, "**", "*.py"), recursive=True)
 ))
@@ -46,10 +79,6 @@ def _load(path, name):
     return m
 
 
-def _noop(*a, **k):
-    return None
-
-
 def _load_with_stubs(path, name, max_stub=10):
     for _ in range(max_stub):
         try:
@@ -57,14 +86,10 @@ def _load_with_stubs(path, name, max_stub=10):
         except ModuleNotFoundError as e:
             missing = e.name
             print("  auto-stub module:", missing)
-            mod = types.ModuleType(missing)
-            mod.__path__ = []
-            mod.__all__ = []
-            mod.__getattr__ = lambda attr: _noop
-            sys.modules[missing] = mod
+            _make_stub(missing)
             parent = missing.rsplit(".", 1)[0]
             if parent in sys.modules:
-                setattr(sys.modules[parent], missing.rsplit(".", 1)[1], mod)
+                setattr(sys.modules[parent], missing.rsplit(".", 1)[1], sys.modules[missing])
     raise RuntimeError("too many auto-stubs for %s" % path)
 
 
@@ -248,11 +273,17 @@ for set_name, py_base, class_names in TARGETS:
     if cls is None:
         print("SKIP: no class %s" % (class_names,))
         continue
-    try:
-        net = cls()
-    except Exception as e:
-        print("SKIP: init fail ->", e)
-        traceback.print_exc()
+
+    net = None
+    for ctor in (lambda: cls(), lambda: cls(-1), lambda: cls(local_rank=-1), lambda: cls(None)):
+        try:
+            net = ctor()
+            break
+        except TypeError as e:
+            print("  ctor fail:", e)
+            continue
+    if net is None:
+        print("SKIP: all constructors failed")
         continue
 
     target = getattr(net, "flownet", net)
