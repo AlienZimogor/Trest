@@ -128,7 +128,6 @@ def make_wrapper(net):
             s.n = net
 
         def forward(s, x):
-            # x = (N,7,H,W): img0(3)+img1(3)+timestep(1); модель сама делит его внутри
             i0 = x[:, 0:3]
             i1 = x[:, 3:6]
             tm = x[:, 6:7]
@@ -163,6 +162,7 @@ def make_wrapper(net):
     return W(), fparams
 
 
+dummy = torch.randn(1, 7, 384, 512)
 produced = []
 for set_name, py_base, class_names in TARGETS:
     py = find_py(py_base)
@@ -185,7 +185,8 @@ for set_name, py_base, class_names in TARGETS:
     net = cls()
     best_map, best_miss = None, None
     for map_name, sd in (("direct", sd_base),
-                         ("flownet.", {"flownet." + k: v for k, v in sd_base.items()})):
+                         ("flownet.", {"flownet." + k: v for k, v in sd_base.items()}),
+                         ("refine.", {"refine." + k: v for k, v in sd_base.items()})):
         miss, unexp = net.load_state_dict(sd, strict=False)
         print("SET %s map=%s missing=%d unexpected=%d" %
               (set_name, map_name, len(miss), len(unexp)))
@@ -199,17 +200,20 @@ for set_name, py_base, class_names in TARGETS:
         continue
     net.load_state_dict(
         sd_base if best_map == "direct"
-        else {"flownet." + k: v for k, v in sd_base.items()},
+        else {best_map + k: v for k, v in sd_base.items()},
         strict=False)
     net.eval()
     w, fparams = make_wrapper(net)
     print("SET %s: forward params %s" % (set_name, fparams))
-    onnx_path = "rife_%s.onnx" % set_name
-    dummy = torch.randn(1, 7, 384, 512)
-    with torch.no_grad():
-        ref = w(dummy)
+    try:
+        with torch.no_grad():
+            ref = w(dummy)
+    except Exception as e:
+        print("SET %s: SKIP (forward fail: %s)" % (set_name, e))
+        continue
     print("SET %s REF out %s mean=%.4f min=%.4f max=%.4f" %
           (set_name, tuple(ref.shape), ref.mean(), ref.min(), ref.max()))
+    onnx_path = "rife_%s.onnx" % set_name
     torch.onnx.export(w, dummy, onnx_path, opset_version=13,
                       input_names=["in0"], output_names=["out0"],
                       do_constant_folding=True)
