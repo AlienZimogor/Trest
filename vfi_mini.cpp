@@ -21,7 +21,6 @@ static double now_ms() {
 }
 
 static bool g_warp_gpu = false;
-static int g_reshmode = 1;
 
 static std::atomic<int> g_frame{0};
 static std::atomic<int> g_frames{0};
@@ -78,15 +77,27 @@ public:
                         const ncnn::Option& opt) const {
         const ncnn::Mat& b = bb[0];
         const int total = (int)b.total();
+        ncnn::Mat& top = tb[0];
+        if (name == "reshape_133") {
+            top.create(b.w, b.h, b.c, b.elemsize, b.elempack, opt.blob_allocator);
+            if (top.empty()) return -100;
+            memcpy(top.data, b.data, (size_t)total * b.elemsize);
+            return 0;
+        }
         int tw = w > 0 ? w : b.w;
         int th = h > 0 ? h : b.h;
-        if (g_reshmode == 1 && c11 > 0 && tw == b.w && th == b.h && c11 <= b.c) {
-            ncnn::Mat& top = tb[0];
+        if (c11 > 0 && tw == b.w && th == b.h && c11 < b.c) {
             top.create(tw, th, c11, b.elemsize, b.elempack, opt.blob_allocator);
             if (top.empty()) return -100;
             for (int c = 0; c < c11; c++)
-                memcpy(top.channel(c), b.channel(c),
-                       (size_t)tw * th * b.elemsize);
+                memcpy(top.channel(c), b.channel(c), (size_t)tw * th * b.elemsize);
+            return 0;
+        }
+        if (c2 > 0 && tw == b.w && th == b.h && c2 == 2 * b.c) {
+            top.create(tw, th, c2, b.elemsize, b.elempack, opt.blob_allocator);
+            if (top.empty()) return -100;
+            for (int c = 0; c < c2; c++)
+                memcpy(top.channel(c), b.channel(c % b.c), (size_t)tw * th * b.elemsize);
             return 0;
         }
         int tc = 0;
@@ -99,11 +110,6 @@ public:
                 return -100;
             }
         }
-        if (c11 > 0 && tc != c11) {
-            fprintf(stderr, "RESHAPE_DIVERGE %s in=%dx%dx%d c11=%d c2=%d got_tc=%d\n",
-                    name.c_str(), b.w, b.h, b.c, c11, c2, tc);
-        }
-        ncnn::Mat& top = tb[0];
         top.create(tw, th, tc, b.elemsize, b.elempack, opt.blob_allocator);
         if (top.empty()) return -100;
         memcpy(top.data, b.data, (size_t)total * b.elemsize);
@@ -135,81 +141,14 @@ public:
         int off = 0;
         for (int i = 0; i < n; i++) {
             int want = (i < slices.w) ? (int)slices[i] : (C - off);
-            int take = (i == n - 1) ? (C - off) : std::min(want, C - off);
+            int take = (n > 1 && i == n - 1) ? (C - off) : std::min(want, C - off);
             if (take <= 0) { tb[i] = ncnn::Mat(); continue; }
             ncnn::Mat& t = tb[i];
             t.create(b.w, b.h, take, b.elemsize, b.elempack, opt.blob_allocator);
             if (t.empty()) return -100;
             for (int c = 0; c < take; c++)
-                memcpy(t.channel(c), b.channel(off + c),
-                       (size_t)b.w * b.h * b.elemsize);
+                memcpy(t.channel(c), b.channel(off + c), (size_t)b.w * b.h * b.elemsize);
             off += take;
-        }
-        return 0;
-    }
-};
-
-class GridSample_fix : public ncnn::Layer {
-public:
-    int align_corners;
-    GridSample_fix() {
-        align_corners = 1;
-        support_vulkan = false;
-        support_fp16_storage = false;
-        support_packing = false;
-    }
-    virtual int load_param(const ncnn::ParamDict& pd) {
-        align_corners = pd.get(2, 1);
-        return 0;
-    }
-    virtual int forward(const std::vector<ncnn::Mat>& bb,
-                        std::vector<ncnn::Mat>& tb,
-                        const ncnn::Option& opt) const {
-        const ncnn::Mat& x = bb[0];
-        const ncnn::Mat& grid = bb[1];
-        const int IW = x.w, IH = x.h, C = x.c;
-        const int GW = grid.w, GH = grid.h;
-        if (x.empty() || grid.empty() || grid.elemsize != 4u || grid.elempack != 1 ||
-            (int)grid.total() < GW * GH * 2) {
-            fprintf(stderr, "GRIDSAMPLE_GUARD %s x=%dx%dx%d grid=%dx%dx%d total=%d\n",
-                    name.c_str(), IW, IH, C, GW, GH, grid.c, (int)grid.total());
-            return -100;
-        }
-        ncnn::Mat& top = tb[0];
-        top.create(GW, GH, C, 4u, opt.blob_allocator);
-        if (top.empty()) return -100;
-        const float* gp = (const float*)grid.data;
-        for (int c = 0; c < C; c++) {
-            const float* xp = x.channel(c);
-            float* tp = top.channel(c);
-            for (int y = 0; y < GH; y++) {
-                for (int xi = 0; xi < GW; xi++) {
-                    const float g0 = gp[(y * GW + xi) * 2];
-                    const float g1 = gp[(y * GW + xi) * 2 + 1];
-                    float sx, sy;
-                    if (align_corners) {
-                        sx = (g0 + 1.f) * (IW - 1) * 0.5f;
-                        sy = (g1 + 1.f) * (IH - 1) * 0.5f;
-                    } else {
-                        sx = ((g0 + 1.f) * IW - 1.f) * 0.5f;
-                        sy = ((g1 + 1.f) * IH - 1.f) * 0.5f;
-                    }
-                    if (sx < 0.f || sx > (float)(IW - 1) ||
-                        sy < 0.f || sy > (float)(IH - 1)) {
-                        tp[y * GW + xi] = 0.f;
-                        continue;
-                    }
-                    const int x0 = (int)sx, y0 = (int)sy;
-                    const int x1 = std::min(x0 + 1, IW - 1);
-                    const int y1 = std::min(y0 + 1, IH - 1);
-                    const float ax = sx - (float)x0, ay = sy - (float)y0;
-                    tp[y * GW + xi] =
-                        (1 - ax) * (1 - ay) * xp[y0 * IW + x0] +
-                        ax * (1 - ay) * xp[y0 * IW + x1] +
-                        (1 - ax) * ay * xp[y1 * IW + x0] +
-                        ax * ay * xp[y1 * IW + x1];
-                }
-            }
         }
         return 0;
     }
@@ -217,7 +156,6 @@ public:
 
 static ncnn::Layer* Reshape_fix_creator(void*) { return new Reshape_fix; }
 static ncnn::Layer* Slice_fix_creator(void*) { return new Slice_fix; }
-static ncnn::Layer* GridSample_fix_creator(void*) { return new GridSample_fix; }
 
 static const char* warp_glsl = R"GLSL(
 #version 450
@@ -280,8 +218,27 @@ public:
     virtual int destroy_pipeline(const ncnn::Option& opt) {
         delete pipeline; pipeline = 0; return 0;
     }
-    virtual int forward_gpu(const std::vector<ncnn::VkMat>&, std::vector<ncnn::VkMat>&,
-                            ncnn::VkCompute&, const ncnn::Option&) const { return -100; }
+    virtual int forward_gpu(const std::vector<ncnn::VkMat>& bottom_blobs,
+                            std::vector<ncnn::VkMat>& top_blobs,
+                            ncnn::VkCompute& cmd,
+                            const ncnn::Option& opt) const {
+        const ncnn::VkMat& x = bottom_blobs[0];
+        const ncnn::VkMat& flow = bottom_blobs[1];
+        const int w = x.w, h = x.h, ch = x.c;
+        if (flow.c != 2 || flow.w < w || flow.h < h) return -100;
+        if (x.elemsize != 4u || flow.elemsize != 4u ||
+            x.elempack != 1 || flow.elempack != 1) return -101;
+        ncnn::VkMat& top = top_blobs[0];
+        top.create(w, h, ch, 4u, 1, opt.blob_vkallocator);
+        if (top.empty()) return -100;
+        std::vector<ncnn::VkMat> bindings(3);
+        bindings[0] = x; bindings[1] = flow; bindings[2] = top;
+        std::vector<ncnn::vk_constant_type> k(7);
+        k[0].i = w; k[1].i = h; k[2].i = flow.w; k[3].i = flow.h;
+        k[4].i = (flow.w - w) / 2; k[5].i = (flow.h - h) / 2; k[6].i = ch;
+        cmd.record_pipeline(pipeline, bindings, k, top);
+        return 0;
+    }
     virtual int forward(const std::vector<ncnn::Mat>& bottom_blobs,
                         std::vector<ncnn::Mat>& top_blobs,
                         const ncnn::Option& opt) const {
@@ -339,7 +296,6 @@ static ncnn::Layer* Warp_layer_creator(void*) { return new Warp_layer; }
 static void register_all(ncnn::Net& net) {
     net.register_custom_layer(ncnn::layer_to_index("Reshape"), Reshape_fix_creator);
     net.register_custom_layer(ncnn::layer_to_index("Slice"), Slice_fix_creator);
-    net.register_custom_layer(ncnn::layer_to_index("GridSample"), GridSample_fix_creator);
     net.register_custom_layer("rife.Warp", Warp_layer_creator);
 }
 
@@ -349,8 +305,7 @@ static int run_net(bool warp_gpu, bool use_vulkan,
     g_warp_gpu = warp_gpu;
     int threads; bool fp16;
     parse_opt(getenv("VFI_OPT"), threads, fp16);
-    printf("opt: thr=%d fp16=%d vulkan=%d reshmode=%d\n",
-           threads, fp16 ? 1 : 0, use_vulkan ? 1 : 0, g_reshmode);
+    printf("opt: thr=%d fp16=%d vulkan=%d\n", threads, fp16 ? 1 : 0, use_vulkan ? 1 : 0);
     ncnn::Net net;
     net.opt.use_vulkan_compute = use_vulkan;
     if (use_vulkan) net.set_vulkan_device(0);
@@ -450,8 +405,7 @@ static int bisect(const char* param, const char* bin, int W, int H) {
     int threads; bool fp16;
     parse_opt(getenv("VFI_OPT"), threads, fp16);
     ncnn::Net net;
-    net.opt.use_vulkan_compute = true;
-    net.set_vulkan_device(0);
+    net.opt.use_vulkan_compute = false;
     net.opt.use_fp16_packed = fp16;
     net.opt.use_fp16_storage = fp16;
     net.opt.use_fp16_arithmetic = false;
@@ -463,7 +417,7 @@ static int bisect(const char* param, const char* bin, int W, int H) {
     if (net.load_model(bin) != 0) { fprintf(stderr, "ERR: load_model failed in bisect\n"); fflush(NULL); return 2; }
     const std::vector<ncnn::Layer*>& lrs = net.layers();
     const int n = (int)lrs.size();
-    printf("bisect: layers=%d (single-pass, reshmode=%d)\n", n, g_reshmode);
+    printf("bisect: layers=%d (single-pass, cpu)\n", n);
     fflush(NULL);
     ncnn::Mat in(W, H, 7);
     for (int c = 0; c < 7; c++) {
@@ -513,27 +467,12 @@ int main(int argc, char** argv) {
     const char* param = argc > 1 ? argv[1] : "flownet.param";
     const char* bin   = argc > 2 ? argv[2] : "flownet.bin";
     int W = argc > 3 ? atoi(argv[3]) : 512;
-    int H = argc > 4 ? atoi(argv[4]) : 384;
+    int H = argc > 4 ? atoi(argv[4]) : 320;
     int runs = argc > 5 ? atoi(argv[5]) : 5;
     const char* mode = argc > 6 ? argv[6] : "gpu";
-    if (strcmp(mode, "bisect") == 0) {
-        return bisect(param, bin, W, H);
-    }
-    if (strcmp(mode, "sweep") == 0) {
-        const int order[2] = {1, 0};
-        for (int k = 0; k < 2; k++) {
-            g_reshmode = order[k];
-            char lab[32];
-            snprintf(lab, sizeof(lab), "sweep%d", order[k]);
-            int rc = run_net(false, false, param, bin, W, H, runs, lab);
-            printf("SWEEP resmode=%d rc=%d\n", order[k], rc);
-            fflush(NULL);
-        }
-        return 0;
-    }
-    if (strcmp(mode, "cpu") == 0) {
+    if (strcmp(mode, "bisect") == 0) return bisect(param, bin, W, H);
+    if (strcmp(mode, "cpu") == 0)
         return run_net(false, false, param, bin, W, H, runs, "cpu") == 0 ? 0 : 3;
-    }
     if (strcmp(mode, "gpuw") == 0) {
         if (ncnn::get_gpu_count() == 0) { fprintf(stderr, "ERR: no vulkan gpu\n"); fflush(NULL); _exit(1); }
         int rc = run_net(true, true, param, bin, W, H, runs, "gpuw");
