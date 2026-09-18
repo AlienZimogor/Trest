@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, os, glob, types, inspect, importlib.util, importlib.machinery
+import sys, os, re, glob, types, inspect, importlib.util, importlib.machinery
 import subprocess, shutil, zipfile, traceback
 import torch
 import torch.nn as nn
@@ -37,12 +37,6 @@ class _DummyObj:
         return _noop
 
 
-def _install_dynamic_globals(mod):
-    def _getattr(name):
-        return _DummyObj
-    mod.__getattr__ = _getattr
-
-
 def _finish_module(mod, name, is_package=True):
     spec = importlib.machinery.ModuleSpec(name, loader=None, is_package=is_package)
     spec.origin = "<stub>"
@@ -65,6 +59,27 @@ def _make_stub(name):
     mod.__getattr__ = _getattr
     sys.modules[name] = mod
     return mod
+
+
+def _missing_name(e):
+    n = getattr(e, "name", None)
+    if n:
+        return n
+    m = re.search(r"name '(\w+)' is not defined", str(e))
+    return m.group(1) if m else None
+
+
+def _call_with_injection(mod, fn, max_inject=16):
+    for _ in range(max_inject):
+        try:
+            return fn()
+        except NameError as e:
+            name = _missing_name(e)
+            if not name or name in mod.__dict__:
+                raise
+            mod.__dict__[name] = _DummyObj
+            print("  injected dummy global:", name)
+    return fn()
 
 
 model_pkg = types.ModuleType("model")
@@ -96,9 +111,7 @@ def _load(path, name):
 def _load_with_stubs(path, name, max_stub=10):
     for _ in range(max_stub):
         try:
-            m = _load(path, name)
-            _install_dynamic_globals(m)
-            return m
+            return _load(path, name)
         except ModuleNotFoundError as e:
             missing = e.name
             print("  auto-stub module:", missing)
@@ -205,11 +218,12 @@ DUMMY = torch.rand(1, 7, 384, 512)
 SCALE = [32.0, 16.0, 8.0, 4.0, 2.0]
 
 
-def make_wrapper_model(net):
+def make_wrapper_model(net, mod):
     class W(nn.Module):
         def __init__(self):
             super().__init__()
             self.net = net
+            self.mod = mod
 
         def forward(self, x):
             i0 = x[:, 0:3]
@@ -223,6 +237,8 @@ def make_wrapper_model(net):
             )):
                 try:
                     return _pick(fn())
+                except NameError:
+                    raise
                 except Exception as e:
                     errs.append("#%d %s: %s" % (idx, type(e).__name__, e))
             print("  Model inference attempts failed:")
@@ -257,6 +273,8 @@ def make_wrapper_ifnet(net):
             for idx, fn in enumerate(attempts):
                 try:
                     return _pick(fn())
+                except NameError:
+                    raise
                 except Exception as e:
                     errs.append("#%d %s: %s" % (idx, type(e).__name__, e))
             print("  IFNet forward attempts failed:")
@@ -293,8 +311,11 @@ for set_name, py_base, class_names in TARGETS:
     net = None
     for ctor in (lambda: cls(), lambda: cls(-1), lambda: cls(local_rank=-1), lambda: cls(None)):
         try:
-            net = ctor()
+            net = _call_with_injection(mod, ctor)
             break
+        except TypeError as e:
+            print("  ctor TypeError:", e)
+            continue
         except Exception as e:
             print("  ctor fail:", type(e).__name__, e)
             continue
@@ -322,11 +343,11 @@ for set_name, py_base, class_names in TARGETS:
         for c in convs_28:
             c.register_forward_hook(hk)
 
-    w = make_wrapper_model(net) if set_name == "rifehdv3" else make_wrapper_ifnet(net)
+    w = make_wrapper_model(net, mod) if set_name == "rifehdv3" else make_wrapper_ifnet(net)
     w.eval()
     try:
         with torch.no_grad():
-            ref = w(DUMMY)
+            ref = _call_with_injection(mod, lambda: w(DUMMY))
     except Exception as e:
         print("SKIP: forward fail ->", e)
         traceback.print_exc()
