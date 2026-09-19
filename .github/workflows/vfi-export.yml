@@ -13,8 +13,8 @@ jobs:
       - name: deps
         run: |
           python -m pip install -q --upgrade pip
-          python -m pip install -q numpy onnx onnxscript
-          python -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -q numpy onnx
+          python -m pip install -q torch==2.6.0+cpu --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -q pnnx
 
       - name: download release zip
@@ -32,8 +32,6 @@ jobs:
           unzip -o model.zip -d model_src
           echo "=== top-level in model_src ==="
           find model_src -maxdepth 3 -type f | sort | head -80
-          echo "=== all .py / .pkl / .pth / .pt ==="
-          find model_src -type f \( -name "*.py" -o -name "*.pkl" -o -name "*.pth" -o -name "*.pt" \) | sort
 
       - name: export
         run: python export_rife.py
