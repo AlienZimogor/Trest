@@ -139,10 +139,21 @@ public:
         const ncnn::Mat& b = bb[0];
         const int C = b.c;
         const int n = (int)tb.size();
+        if (C <= 0 || n <= 0) {
+            for (int i = 0; i < n; i++) tb[i] = ncnn::Mat();
+            return 0;
+        }
+        int pos_sum = 0, n_auto = 0;
+        for (int i = 0; i < n; i++) {
+            int s = (i < slices.w) ? (int)slices[i] : -233;
+            if (s > 0) pos_sum += s; else n_auto++;
+        }
+        int auto_each = n_auto > 0 ? std::max(1, (C - pos_sum) / n_auto) : 0;
         int off = 0;
         for (int i = 0; i < n; i++) {
-            int want = (i < slices.w) ? (int)slices[i] : (C - off);
-            int take = (n > 1 && i == n - 1) ? (C - off) : std::min(want, C - off);
+            int s = (i < slices.w) ? (int)slices[i] : -233;
+            int want = (s > 0) ? s : auto_each;
+            int take = (i == n - 1) ? (C - off) : std::min(want, C - off);
             if (take <= 0) { tb[i] = ncnn::Mat(); continue; }
             ncnn::Mat& t = tb[i];
             t.create(b.w, b.h, take, b.elemsize, b.elempack, opt.blob_allocator);
