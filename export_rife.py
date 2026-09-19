@@ -163,14 +163,9 @@ for d in sorted(glob.glob(os.path.join(ROOT, "**", "refine.py"), recursive=True)
 def _pref(p):
     s = 0
     b = os.path.basename(p).lower()
-    if "4.26" in b or "426" in b:
-        s += 4
-    if "v4" in b:
-        s += 1
-    if "flownet" in b:
-        s -= 3
-    if "__pycache__" in p:
-        s -= 10
+    if "4.26" in b or "426" in b: s += 4
+    if "v4" in b: s += 1
+    if "flownet" in b: s -= 3
     return s
 
 
@@ -181,30 +176,18 @@ pkls = [p for p in
         glob.glob(os.path.join(ROOT, "**", "*.pth"), recursive=True) +
         glob.glob(os.path.join(ROOT, "**", "*.pt"), recursive=True)]
 pkls.sort(key=_pref, reverse=True)
-
-
-def load_sd():
-    print("pkl candidates:")
-    for p in pkls:
-        print("  ", p, "(%.2f MB, pref=%d)" % (os.path.getsize(p)/1e6, _pref(p)))
-    if not pkls:
-        raise SystemExit("no weights found under " + ROOT)
-    sd_raw = torch.load(pkls[0], map_location="cpu", weights_only=False)
-    if isinstance(sd_raw, dict) and "state_dict" in sd_raw:
-        sd_raw = sd_raw["state_dict"]
-    out = {}
-    for k, v in sd_raw.items():
-        k2 = k
-        while k2.startswith("module."):
-            k2 = k2[len("module."):]
-        out[k2] = v
-    return out
-
-
-SD_BASE = load_sd()
-SD_IFNET = {k: v for k, v in SD_BASE.items() if not k.startswith("refine.")}
-SD_REFINE = {k[len("refine."):]: v for k, v in SD_BASE.items() if k.startswith("refine.")}
-print("ifnet keys=%d refine keys=%d" % (len(SD_IFNET), len(SD_REFINE)))
+print("pkl:", pkls[:3])
+sd_raw = torch.load(pkls[0], map_location="cpu", weights_only=False)
+if isinstance(sd_raw, dict) and "state_dict" in sd_raw:
+    sd_raw = sd_raw["state_dict"]
+sd = {}
+for k, v in sd_raw.items():
+    k2 = k
+    while k2.startswith("module."):
+        k2 = k2[len("module."):]
+    sd[k2] = v
+SD_IFNET = {k: v for k, v in sd.items() if not k.startswith("refine.")}
+SD_REFINE = {k[len("refine."):]: v for k, v in sd.items() if k.startswith("refine.")}
 
 TARGETS = [
     ("rifehdv3", "RIFE_HDv3.py", ["Model", "RIFE", "RIFE_HDv3"]),
@@ -220,24 +203,19 @@ def find_py(base):
 
 
 def probe_call(net, is_model):
-    """Eager-проба форм вызова (лямбды только здесь, вне трейса)."""
-    i0 = DUMMY[:, 0:3]
-    i1 = DUMMY[:, 3:6]
+    i0 = DUMMY[:, 0:3]; i1 = DUMMY[:, 3:6]
     ts = DUMMY[:, 6:7].mean(dim=(2, 3), keepdim=True)
-    if is_model:
-        forms = [
-            lambda: net.inference(i0, i1, 0.5),
-            lambda: net.inference(i0, i1, ts),
-            lambda: net.inference(i0, i1),
-            lambda: net(i0, i1, 0.5),
-        ]
-    else:
-        forms = [
-            lambda: net(DUMMY, ts, SCALE, False, True, False),
-            lambda: net(DUMMY, ts, SCALE, False, False, False),
-            lambda: net(DUMMY, ts, SCALE),
-            lambda: net(DUMMY, ts),
-        ]
+    forms = ([
+        lambda: net.inference(i0, i1, 0.5),
+        lambda: net.inference(i0, i1, ts),
+        lambda: net.inference(i0, i1),
+        lambda: net(i0, i1, 0.5),
+    ] if is_model else [
+        lambda: net(DUMMY, ts, SCALE, False, True, False),
+        lambda: net(DUMMY, ts, SCALE, False, False, False),
+        lambda: net(DUMMY, ts, SCALE),
+        lambda: net(DUMMY, ts),
+    ])
     for k, fn in enumerate(forms):
         try:
             with torch.no_grad():
@@ -257,7 +235,6 @@ def probe_call(net, is_model):
 
 
 class W(nn.Module):
-    """TorchScript-трейсибельная обёртка: без лямбд, прямые вызовы в if-цепочке."""
     def __init__(self, net, kind, out_idx):
         super().__init__()
         self.net = net
@@ -273,8 +250,7 @@ class W(nn.Module):
             return out[1]
         elif self.out_idx == 2:
             return out[2]
-        else:
-            return out[3]
+        return out[3]
 
     def forward(self, x):
         i0 = x[:, 0:3]
@@ -305,7 +281,6 @@ def build_set(set_name):
     if py is None:
         print("SKIP: py %s not found" % py_base)
         return None
-    print("py:", py)
     try:
         mod = _load_with_stubs(py, "prov_%s" % set_name)
     except Exception as e:
@@ -325,8 +300,7 @@ def build_set(set_name):
         try:
             net = _call_with_injection(mod, ctor)
             break
-        except TypeError as e:
-            print("  ctor TypeError:", e)
+        except TypeError:
             continue
         except Exception as e:
             print("  ctor fail:", type(e).__name__, e)
@@ -336,7 +310,7 @@ def build_set(set_name):
         return None
     target = getattr(net, "flownet", net)
     miss, unexp = target.load_state_dict(SD_IFNET, strict=False)
-    print("  flownet/IFNet load missing=%d unexpected=%d" % (len(miss), len(unexp)))
+    print("  flownet load missing=%d unexpected=%d" % (len(miss), len(unexp)))
     if hasattr(net, "refine") and SD_REFINE:
         m2, u2 = net.refine.load_state_dict(SD_REFINE, strict=False)
         print("  refine load missing=%d unexpected=%d" % (len(m2), len(u2)))
@@ -344,15 +318,14 @@ def build_set(set_name):
         print("SKIP: missing=%d > 0" % len(miss))
         return None
     net.eval()
-    is_model = (set_name == "rifehdv3")
-    pr = probe_call(net, is_model)
+    pr = probe_call(net, set_name == "rifehdv3")
     if pr is None:
         print("SKIP: no working call form")
         return None
-    kind, out_idx = pr
-    kind = kind + (0 if is_model else 4)
-    print("  probe ok: kind=%d out_idx=%d" % (kind, out_idx))
-    return W(net, kind, out_idx)
+    k, idx = pr
+    kind = k + (0 if set_name == "rifehdv3" else 4)
+    print("  probe ok: kind=%d out_idx=%d" % (kind, idx))
+    return W(net, kind, idx)
 
 
 def do_export(set_name, kind):
@@ -362,10 +335,10 @@ def do_export(set_name, kind):
     w = build_set(set_name)
     if w is None:
         sys.exit(2)
-    if kind == "dynamo":
-        torch.onnx.export(w, DUMMY, onnx_path, dynamo=True, **kw)
-    else:
+    if kind == "legacy":
         torch.onnx.export(w, DUMMY, onnx_path, dynamo=False, **kw)
+    else:
+        torch.onnx.export(w, DUMMY, onnx_path, dynamo=True, **kw)
     sys.exit(0)
 
 
@@ -373,7 +346,7 @@ if len(sys.argv) > 1 and sys.argv[1] == "child-export":
     do_export(sys.argv[2], sys.argv[3])
 
 produced = []
-external_data_files = []
+external = []
 for set_name, py_base, class_names in TARGETS:
     print("\n========== SET %s ==========" % set_name)
     w = build_set(set_name)
@@ -392,7 +365,7 @@ for set_name, py_base, class_names in TARGETS:
         continue
     onnx_path = "rife_%s.onnx" % set_name
     ok = False
-    for kind in ("dynamo", "legacy"):
+    for kind in ("legacy", "dynamo"):
         print("  trying onnx export kind=%s (subprocess)..." % kind)
         r = subprocess.run([sys.executable, "-u", "-X", "faulthandler",
                             os.path.abspath(__file__), "child-export", set_name, kind])
@@ -405,19 +378,19 @@ for set_name, py_base, class_names in TARGETS:
         sz = os.path.getsize(onnx_path)
         elems, has_ext = onnx_inspect(onnx_path)
         print("  ONNX (%s): %s size=%.2f MB weight_elems=%d external=%s" %
-              (kind, onnx_path, sz/1e6, elems, has_ext))
+              (kind, onnx_path, sz / 1e6, elems, has_ext))
         if has_ext:
             data = onnx_path + ".data"
             if os.path.isfile(data):
-                external_data_files.append((set_name, data))
+                external.append((set_name, data))
                 ok = True
                 break
-            print("  external data file missing -> reject")
+            print("  external data missing -> reject")
             continue
         if sz >= MIN_ONNX_BYTES and elems >= MIN_WEIGHT_ELEMS:
             ok = True
             break
-        print("  ONNX lacks weights (size/elems too small) -> try next kind")
+        print("  ONNX lacks weights -> try next kind")
     if ok:
         produced.append(set_name)
 
@@ -433,7 +406,7 @@ for s in list(produced):
     for ext in ("param", "bin"):
         f = "rife_%s.ncnn.%s" % (s, ext)
         if os.path.isfile(f):
-            print("  pnnx out:", f, "(%.2f MB)" % (os.path.getsize(f)/1e6))
+            print("  pnnx out:", f, "(%.2f MB)" % (os.path.getsize(f) / 1e6))
         else:
             print("  MISSING:", f)
             if s in produced:
@@ -442,16 +415,14 @@ for s in list(produced):
 print("\n========== PACKING ==========")
 print("PRODUCED SETS:", produced)
 if not produced:
-    raise SystemExit("no sets produced — check logs above")
+    raise SystemExit("no sets produced")
 with zipfile.ZipFile("rife_models.zip", "w", zipfile.ZIP_DEFLATED) as z:
     for s in produced:
         for ext in ("param", "bin"):
             f = "rife_%s.ncnn.%s" % (s, ext)
             if os.path.isfile(f):
                 z.write(f, os.path.join(s, os.path.basename(f)))
-                print("  packed:", os.path.join(s, os.path.basename(f)))
-    for s, data in external_data_files:
+    for s, data in external:
         if s in produced:
             z.write(data, os.path.join(s, os.path.basename(data)))
-            print("  packed external:", os.path.join(s, os.path.basename(data)))
-print("ZIP OK: rife_models.zip (%.2f MB)" % (os.path.getsize("rife_models.zip")/1e6))
+print("ZIP OK: rife_models.zip (%.2f MB)" % (os.path.getsize("rife_models.zip") / 1e6))
