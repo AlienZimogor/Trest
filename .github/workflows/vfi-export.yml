@@ -39,7 +39,7 @@ jobs:
         run: |
           set +e
           ls -la *.onnx 2>/dev/null
-          for onnx in rife_hand.onnx; do
+          for onnx in rife_hand.onnx rife_ifnet.onnx rife_rifehdv3.onnx; do
             if [ -f "$onnx" ]; then
               echo "=== running pnnx on $onnx ==="
               pnnx "$onnx" inputshape=[1,7,384,512]
@@ -57,4 +57,10 @@ jobs:
             rife_hand.onnx
             rife_hand.ncnn.param
             rife_hand.ncnn.bin
+            rife_ifnet.onnx
+            rife_ifnet.ncnn.param
+            rife_ifnet.ncnn.bin
+            rife_rifehdv3.onnx
+            rife_rifehdv3.ncnn.param
+            rife_rifehdv3.ncnn.bin
           if-no-files-found: ignore
