@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Инкремент 1: минимальный рукописный ncnn (Crop->Conv) для проверки
-формата bin и загрузки весов. Вес первой 3->16 свёртки ищется по форме,
-имя ключа печатается. Ожидание бисекта: Crop c=3, Conv c=16, ALL LAYERS OK."""
+"""Инкремент 2: scale0 conv-цепочка (3->16->16->16). Ожидание бисекта:
+layers=5, Crop c=3, conv0/1/2 c=16, ALL LAYERS OK."""
 import struct, os, glob
 import torch
 
@@ -20,7 +19,6 @@ pkls = [p for p in
         glob.glob(os.path.join("model_src", "**", "*.pth"), recursive=True) +
         glob.glob(os.path.join("model_src", "**", "*.pt"), recursive=True)]
 pkls.sort(key=_pref, reverse=True)
-print("pkl:", pkls[:3])
 sd_raw = torch.load(pkls[0], map_location="cpu", weights_only=False)
 if isinstance(sd_raw, dict) and "state_dict" in sd_raw:
     sd_raw = sd_raw["state_dict"]
@@ -31,35 +29,40 @@ for k, v in sd_raw.items():
         k2 = k2[len("module."):]
     sd[k2] = v
 
-W = B = None
-wkey = None
+convs = []   # (key, W, B) в порядке ключей
 for k, v in sd.items():
-    if v.dim() == 4 and tuple(v.shape) == (16, 3, 3, 3):
-        W = v
-        wkey = k
-        B = sd.get(k.replace(".weight", ".bias"))
+    if v.dim() == 4 and tuple(v.shape) in ((16, 3, 3, 3), (16, 16, 3, 3)):
+        b = sd.get(k.replace(".weight", ".bias"))
+        if b is not None and tuple(b.shape) == (16,):
+            convs.append((k, v, b))
+    if len(convs) == 3:
         break
-print("found conv weight key:", wkey, "W", tuple(W.shape), "B",
-      tuple(B.shape) if B is not None else None)
-assert W is not None, "no (16,3,3,3) conv weight found"
-assert B is not None and tuple(B.shape) == (16,), "bias mismatch"
+print("picked convs:", [(k, tuple(w.shape)) for k, w, _ in convs])
+assert len(convs) == 3 and tuple(convs[0][1].shape) == (16, 3, 3, 3)
 
 
 def wblob(f, t):
     a = t.detach().cpu().contiguous()
-    f.write(struct.pack("<i", 0))          # flag 0 = fp32 raw
+    f.write(struct.pack("<i", 0))
     f.write(a.numpy().astype("<f4").tobytes())
 
 
 with open("rife_hand.ncnn.param", "w") as f:
     f.write("7767577\n")
-    f.write("3 2\n")
+    f.write("5 5\n")
     f.write("Input in0 0 1 in0\n")
     f.write("Crop crop0 1 1 in0 c0 2=0 5=3\n")
-    f.write("Convolution conv0 1 1 c0 out0 0=16 1=3 5=1 6=%d\n" % W.numel())
+    prev = "c0"
+    for i, (k, w, b) in enumerate(convs):
+        out = "f%d" % i
+        f.write("Convolution conv%d 1 1 %s %s 0=16 1=3 5=1 6=%d\n"
+                % (i, prev, out, w.numel()))
+        prev = out
 
 with open("rife_hand.ncnn.bin", "wb") as f:
-    wblob(f, W)
-    wblob(f, B)
+    for k, w, b in convs:
+        wblob(f, w)
+        wblob(f, b)
 
-print("wrote rife_hand.ncnn.param / .bin (%d bytes)" % os.path.getsize("rife_hand.ncnn.bin"))
+print("wrote rife_hand.ncnn.param / .bin (%d bytes)"
+      % os.path.getsize("rife_hand.ncnn.bin"))
