@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""RIFE v4.26 -> ncnn (param/bin) своим конвертером.
-v18: grid_sample экспортируется через кастомный symbolic с Transpose(0,3,1,2)
-на grid, чтобы pnnx дал ncnn GridSample корректный grid (W,H,2)."""
+"""RIFE v4.26 -> ONNX(opset16, native GridSample) -> pnnx -> ncnn.
+v19: remap ключей pkl (encode.*/block*.*) во внутренние имена + чистый F.grid_sample."""
 import os, glob
 import torch
 import torch.nn as nn
@@ -23,43 +22,45 @@ pkls = [p for p in
         glob.glob(os.path.join("model_src", "**", "*.pt"), recursive=True)]
 pkls.sort(key=_pref, reverse=True)
 print("pkl:", pkls[:3])
-sd_raw = torch.load(pkls[0], map_location="cpu", weights_only=False)
-if isinstance(sd_raw, dict) and "state_dict" in sd_raw:
-    sd_raw = sd_raw["state_dict"]
-sd = {}
-for k, v in sd_raw.items():
+raw = torch.load(pkls[0], map_location="cpu", weights_only=False)
+if isinstance(raw, dict) and "state_dict" in raw:
+    raw = raw["state_dict"]
+clean = {}
+for k, v in raw.items():
     k2 = k
     while k2.startswith("module."):
         k2 = k2[len("module."):]
-    sd[k2] = v
+    clean[k2] = v
 
+REN = {
+    "e0": "encode.cnn0", "e1": "encode.cnn1",
+    "e2": "encode.cnn2", "ed": "encode.cnn3",
+}
+for i in range(5):
+    REN["b%d.c0" % i] = "block%d.conv0.0.0" % i
+    REN["b%d.c1" % i] = "block%d.conv0.1.0" % i
+    for n in range(8):
+        REN["b%d.cb.%d.c" % (i, n)] = "block%d.convblock.%d.conv" % (i, n)
+        REN["b%d.cb.%d.beta" % (i, n)] = "block%d.convblock.%d.beta" % (i, n)
+    REN["b%d.last" % i] = "block%d.lastconv.0" % i
 
-class _GridSampleOp(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, grid):
-        return F.grid_sample(x, grid, align_corners=True,
-                             padding_mode="zeros", mode="bilinear")
-
-    @staticmethod
-    def symbolic(g, x, grid):
-        gt = g.op("Transpose", grid, perm_i=[0, 3, 1, 2])
-        return g.op("GridSample", x, gt,
-                    align_corners_i=1, mode_s="bilinear",
-                    padding_mode_s="zeros")
-
-
-def warp(x, flow):
-    N, C, H, W = x.shape
-    ys = torch.arange(H, device=x.device, dtype=x.dtype)
-    xs = torch.arange(W, device=x.device, dtype=x.dtype)
-    gy, gx = torch.meshgrid(ys, xs, indexing="ij")
-    base = torch.stack([gx, gy], dim=-1).unsqueeze(0)
-    f = flow.permute(0, 2, 3, 1).float()
-    vgrid = base + f
-    vgrid = torch.stack([
-        2.0 * vgrid[..., 0] / max(W - 1, 1) - 1.0,
-        2.0 * vgrid[..., 1] / max(H - 1, 1) - 1.0], dim=-1)
-    return _GridSampleOp.apply(x, vgrid)
+sd = {}
+missing = []
+for internal, src in REN.items():
+    if internal.endswith(".beta"):
+        if src in clean:
+            sd[internal] = clean[src]
+        else:
+            missing.append(src)
+    else:
+        if (src + ".weight") in clean:
+            sd[internal + ".weight"] = clean[src + ".weight"]
+        else:
+            missing.append(src + ".weight")
+        if (src + ".bias") in clean:
+            sd[internal + ".bias"] = clean[src + ".bias"]
+print("remapped tensors:", len(sd), "missing:", missing[:8])
+assert not missing, missing
 
 
 def conv(key, stride=1):
@@ -80,6 +81,21 @@ def deconv(key):
         c.weight.copy_(w)
         if b is not None: c.bias.copy_(b)
     return c
+
+
+def warp(x, flow):
+    N, C, H, W = x.shape
+    ys = torch.arange(H, device=x.device, dtype=x.dtype)
+    xs = torch.arange(W, device=x.device, dtype=x.dtype)
+    gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+    base = torch.stack([gx, gy], dim=-1).unsqueeze(0)          # (1,H,W,2)
+    f = flow.permute(0, 2, 3, 1).float()                        # (N,H,W,2)
+    vgrid = base + f
+    vgrid = torch.stack([
+        2.0 * vgrid[..., 0] / max(W - 1, 1) - 1.0,
+        2.0 * vgrid[..., 1] / max(H - 1, 1) - 1.0], dim=-1)    # (N,H,W,2)
+    return F.grid_sample(x, vgrid, align_corners=True,
+                         mode="bilinear", padding_mode="zeros")
 
 
 class ConvBlock(nn.Module):
@@ -155,7 +171,8 @@ net = Net().eval()
 x = torch.rand(1, 7, 384, 512)
 with torch.no_grad():
     y = net(x)
-print("eager out:", tuple(y.shape), "mean=%.4f" % float(y.mean()))
+print("eager out:", tuple(y.shape), "mean=%.4f min=%.4f max=%.4f"
+      % (float(y.mean()), float(y.min()), float(y.max())))
 torch.onnx.export(net, x, "rife_hand.onnx", opset_version=16,
                   input_names=["in0"], output_names=["out0"],
                   dynamo=False, do_constant_folding=True)
