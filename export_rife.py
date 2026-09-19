@@ -11,14 +11,33 @@ except Exception:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import onnx
 
 ROOT = "model_src"
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 MIN_ONNX_BYTES = 8_000_000
+MIN_WEIGHT_ELEMS = 2_000_000
 DUMMY = torch.rand(1, 7, 384, 512)
 SCALE = [32.0, 16.0, 8.0, 4.0, 2.0]
+
+_ELEM_BYTES = {1: 4, 2: 1, 3: 1, 4: 1, 5: 2, 6: 4, 7: 8, 9: 8,
+               10: 2, 11: 2, 12: 4, 13: 8, 14: 4, 15: 4, 16: 8, 17: 4}
+
+
+def onnx_inspect(path):
+    m = onnx.load(path, load_external_data=False)
+    elems = 0
+    has_external = False
+    for init in m.graph.initializer:
+        cnt = 1
+        for d in init.dims:
+            cnt *= d
+        elems += cnt
+        if init.external_data:
+            has_external = True
+    return elems, has_external
 
 
 def _warp(x, flow):
@@ -344,10 +363,10 @@ def do_export(set_name, kind):
     w = build_set(set_name)
     if w is None:
         sys.exit(2)
-    if kind == "legacy":
-        torch.onnx.export(w, DUMMY, onnx_path, dynamo=False, **kw)
+    if kind == "dynamo":
+        torch.onnx.export(w, DUMMY, onnx_path, dynamo=True, **kw)
     else:
-        torch.onnx.export(w, DUMMY, onnx_path, **kw)
+        torch.onnx.export(w, DUMMY, onnx_path, dynamo=False, **kw)
     sys.exit(0)
 
 
@@ -355,6 +374,7 @@ if len(sys.argv) > 1 and sys.argv[1] == "child-export":
     do_export(sys.argv[2], sys.argv[3])
 
 produced = []
+external_data_files = []
 for set_name, py_base, class_names in TARGETS:
     print("\n========== SET %s ==========" % set_name)
     w = build_set(set_name)
@@ -373,7 +393,7 @@ for set_name, py_base, class_names in TARGETS:
         continue
     onnx_path = "rife_%s.onnx" % set_name
     ok = False
-    for kind in ("legacy", "dynamo"):
+    for kind in ("dynamo", "legacy"):
         print("  trying onnx export kind=%s (subprocess)..." % kind)
         r = subprocess.run([sys.executable, "-u", "-X", "faulthandler",
                             os.path.abspath(__file__), "child-export", set_name, kind])
@@ -384,11 +404,21 @@ for set_name, py_base, class_names in TARGETS:
             print("  child-export %s produced no file" % kind)
             continue
         sz = os.path.getsize(onnx_path)
-        print("  ONNX exported (%s): %s (%.2f MB)" % (kind, onnx_path, sz/1e6))
-        if sz >= MIN_ONNX_BYTES:
+        elems, has_ext = onnx_inspect(onnx_path)
+        print("  ONNX (%s): %s size=%.2f MB weight_elems=%d external=%s" %
+              (kind, onnx_path, sz/1e6, elems, has_ext))
+        if has_ext:
+            data = onnx_path + ".data"
+            if os.path.isfile(data):
+                external_data_files.append((set_name, data))
+                ok = True
+                break
+            print("  external data file missing -> reject")
+            continue
+        if sz >= MIN_ONNX_BYTES and elems >= MIN_WEIGHT_ELEMS:
             ok = True
             break
-        print("  ONNX too small (%d B) — weights not embedded; trying next kind" % sz)
+        print("  ONNX lacks weights (size/elems too small) -> try next kind")
     if ok:
         produced.append(set_name)
 
@@ -403,9 +433,12 @@ for s in list(produced):
         produced.remove(s); continue
     for ext in ("param", "bin"):
         f = "rife_%s.ncnn.%s" % (s, ext)
-        print("  pnnx out:", f, "(%.2f MB)" % (os.path.getsize(f)/1e6) if os.path.isfile(f) else " MISSING")
-        if not os.path.isfile(f) and s in produced:
-            produced.remove(s)
+        if os.path.isfile(f):
+            print("  pnnx out:", f, "(%.2f MB)" % (os.path.getsize(f)/1e6))
+        else:
+            print("  MISSING:", f)
+            if s in produced:
+                produced.remove(s)
 
 print("\n========== PACKING ==========")
 print("PRODUCED SETS:", produced)
@@ -418,4 +451,8 @@ with zipfile.ZipFile("rife_models.zip", "w", zipfile.ZIP_DEFLATED) as z:
             if os.path.isfile(f):
                 z.write(f, os.path.join(s, os.path.basename(f)))
                 print("  packed:", os.path.join(s, os.path.basename(f)))
+    for s, data in external_data_files:
+        if s in produced:
+            z.write(data, os.path.join(s, os.path.basename(data)))
+            print("  packed external:", os.path.join(s, os.path.basename(data)))
 print("ZIP OK: rife_models.zip (%.2f MB)" % (os.path.getsize("rife_models.zip")/1e6))
