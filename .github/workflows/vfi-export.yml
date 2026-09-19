@@ -39,16 +39,21 @@ jobs:
         run: |
           set +e
           ls -la *.onnx 2>/dev/null
-          for onnx in rife_hand.onnx rife_ifnet.onnx rife_rifehdv3.onnx; do
+          for onnx in rife_hand.onnx; do
             if [ -f "$onnx" ]; then
               echo "=== running pnnx on $onnx ==="
               pnnx "$onnx" inputshape=[1,7,384,512]
-              echo "=== PARAM HEAD of ${onnx%.onnx}.ncnn.param ==="
-              head -12 "${onnx%.onnx}.ncnn.param" 2>/dev/null
-              echo "=== LAYER TYPES ==="
+              echo "=== LAYER TYPES before surgery ==="
               awk 'NR>2 {print $1}' "${onnx%.onnx}.ncnn.param" 2>/dev/null | sort | uniq -c | sort -rn
             fi
           done
+          if [ -f rife_hand.ncnn.param ]; then
+            echo "=== param surgery: GridSample -> rife.Warp ==="
+            python rife_param_surgery.py rife_hand.ncnn.param
+            echo "=== LAYER TYPES after surgery ==="
+            awk 'NR>2 {print $1}' rife_hand.ncnn.param | sort | uniq -c | sort -rn
+            head -12 rife_hand.ncnn.param
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -57,10 +62,4 @@ jobs:
             rife_hand.onnx
             rife_hand.ncnn.param
             rife_hand.ncnn.bin
-            rife_ifnet.onnx
-            rife_ifnet.ncnn.param
-            rife_ifnet.ncnn.bin
-            rife_rifehdv3.onnx
-            rife_rifehdv3.ncnn.param
-            rife_rifehdv3.ncnn.bin
           if-no-files-found: ignore
