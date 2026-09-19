@@ -30,11 +30,12 @@ jobs:
           curl -sL -H "Authorization: Bearer $GH_TOKEN" \
                -H "Accept: application/octet-stream" "$URL" -o model.zip
           unzip -o model.zip -d model_src
-          echo "=== top-level in model_src ==="
           find model_src -maxdepth 3 -type f | sort | head -80
 
       - name: export
-        run: python -u -X faulthandler rife_ncnn_writer.py xxd rife_hand.ncnn.param | head -4
+        run: |
+          python -u -X faulthandler rife_ncnn_writer.py
+          xxd rife_hand.ncnn.param | head -4
 
       - name: pnnx
         run: |
@@ -44,8 +45,6 @@ jobs:
             if [ -f "$onnx" ]; then
               echo "=== running pnnx on $onnx ==="
               pnnx "$onnx" inputshape=[1,7,384,512]
-              echo "=== PARAM HEAD of ${onnx%.onnx}.ncnn.param ==="
-              head -30 "${onnx%.onnx}.ncnn.param" 2>/dev/null
               echo "=== LAYER TYPES ==="
               awk 'NR>2 {print $1}' "${onnx%.onnx}.ncnn.param" 2>/dev/null | sort | uniq -c | sort -rn
             fi
@@ -55,13 +54,10 @@ jobs:
         with:
           name: rife-models
           path: |
-            rife_models.zip
             rife_hand.ncnn.param
             rife_hand.ncnn.bin
-            rife_ifnet.onnx
             rife_ifnet.ncnn.param
             rife_ifnet.ncnn.bin
-            rife_rifehdv3.onnx
             rife_rifehdv3.ncnn.param
             rife_rifehdv3.ncnn.bin
-          if-no-files-found: warn
+          if-no-files-found: ignore
