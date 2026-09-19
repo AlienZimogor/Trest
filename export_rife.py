@@ -9,7 +9,7 @@ ROOT = "model_src"
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-MIN_ONNX_BYTES = 8_000_000   # fp32 RIFE v4.26 ~24 MB; меньше = веса не встроены
+MIN_ONNX_BYTES = 8_000_000
 
 
 def _warp(x, flow):
@@ -30,13 +30,13 @@ def _noop(*a, **k):
     return None
 
 
-class _DummyObj:
+class _DummyModule(nn.Module):
+    """TorchScript-безопасная заглушка для тренировочных глобалов (EPE, SOBEL, ...)."""
     def __init__(self, *a, **k):
-        pass
-    def __call__(self, *a, **k):
+        super().__init__()
+
+    def forward(self, *a, **k):
         return torch.zeros(1)
-    def __getattr__(self, n):
-        return _noop
 
 
 def _finish_module(mod, name, is_package=True):
@@ -79,7 +79,7 @@ def _call_with_injection(mod, fn, max_inject=16):
             name = _missing_name(e)
             if not name or name in mod.__dict__:
                 raise
-            mod.__dict__[name] = _DummyObj
+            mod.__dict__[name] = _DummyModule
             print("  injected dummy global:", name)
     return fn()
 
@@ -366,15 +366,13 @@ for set_name, py_base, class_names in TARGETS:
         continue
 
     onnx_path = "rife_%s.onnx" % set_name
+    kw = dict(opset_version=13, input_names=["in0"], output_names=["out0"],
+              do_constant_folding=True)
     try:
-        torch.onnx.export(
-            w, DUMMY, onnx_path,
-            opset_version=13,
-            input_names=["in0"],
-            output_names=["out0"],
-            do_constant_folding=True,
-            dynamo=False,
-        )
+        try:
+            torch.onnx.export(w, DUMMY, onnx_path, dynamo=False, **kw)
+        except TypeError:
+            torch.onnx.export(w, DUMMY, onnx_path, **kw)
     except Exception as e:
         print("SKIP: onnx export fail ->", e)
         traceback.print_exc()
@@ -386,7 +384,6 @@ for set_name, py_base, class_names in TARGETS:
         continue
     produced.append(set_name)
 
-# ===== pnnx ВНУТРИ скрипта, чтобы param/bin существовали до упаковки =====
 pnnx = shutil.which("pnnx") or "pnnx"
 for s in list(produced):
     onnx_path = "rife_%s.onnx" % s
