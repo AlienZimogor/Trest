@@ -57,7 +57,7 @@ static void dump_param_head(const char* path) {
 
 static int load_param_safe(ncnn::Net& net, const char* path) {
     FILE* fp = fopen(path, "rb");
-    if (!fp) { fprintf(stderr, "PARAMMEM: cannot open %s\n", path); return -1; }
+    if (!fp) { fprintf(stderr, "PARAMMEM: cannot open %s\n", path); fflush(stderr); return -1; }
     fseek(fp, 0, SEEK_END);
     long sz = ftell(fp);
     fseek(fp, 0, SEEK_SET);
@@ -65,12 +65,12 @@ static int load_param_safe(ncnn::Net& net, const char* path) {
     std::vector<char> buf((size_t)sz + 1, 0);
     size_t rd = fread(buf.data(), 1, (size_t)sz, fp);
     fclose(fp);
-    if ((long)rd != sz) { fprintf(stderr, "PARAMMEM: short read %zu/%ld\n", rd, sz); return -1; }
+    if ((long)rd != sz) { fprintf(stderr, "PARAMMEM: short read %zu/%ld\n", rd, sz); fflush(stderr); return -1; }
     fprintf(stderr, "PARAMMEM size=%ld first16:", sz);
     for (int i = 0; i < 16; i++) fprintf(stderr, " %02x", (unsigned char)buf[i]);
     fprintf(stderr, "\n");
     fflush(stderr);
-    return net.load_param_mem(buf.data(), (size_t)sz);
+    return net.load_param_mem(buf.data());
 }
 
 static void parse_opt(const char* e, int& threads, bool& fp16) {
