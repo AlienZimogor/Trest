@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Инкремент 2: scale0 = Conv(7->16) x3 + ConvTranspose(16->4) = flow0.
-Ожидание бисекта: layers=5, conv_0/1/2 c=16 @512x384,
-Deconvolution c=4 @1024x768, ALL LAYERS OK."""
+"""Инкремент 3a: scale1 = Concat(15ch) + Conv(15->96).
+Ожидание бисекта: layers=7, Input(3)+Input(3)+Input(4)+Input(16)+Input(16)
+-> Concat c=15 -> Conv c=96, ALL LAYERS OK."""
 import os, glob
 import torch
 import torch.nn as nn
@@ -32,54 +32,46 @@ for k, v in sd_raw.items():
         k2 = k2[len("module."):]
     sd[k2] = v
 
-c0, b0 = sd["encode.cnn0.weight"], sd["encode.cnn0.bias"]
-c1, b1 = sd["encode.cnn1.weight"], sd["encode.cnn1.bias"]
-c2, b2 = sd["encode.cnn2.weight"], sd["encode.cnn2.bias"]
-
-dk = db = dkey = None
+# Ищем первую conv scale1: (96, 15, 3, 3) или (96, 15, 1, 1)
+w96_15 = b96_15 = key96_15 = None
 for k, v in sd.items():
-    if (v.dim() == 4 and v.shape[0] == 16 and v.shape[1] == 4
-            and v.shape[2] == v.shape[3] and v.shape[2] in (2, 4)):
-        dk, dkey = v, k
-        db = sd.get(k.replace(".weight", ".bias"))
+    if v.dim() == 4 and v.shape[0] == 96 and v.shape[1] == 15:
+        w96_15 = v
+        key96_15 = k
+        b96_15 = sd.get(k.replace(".weight", ".bias"))
         break
-print("deconv key:", dkey, tuple(dk.shape) if dk is not None else None)
-assert dk is not None, "deconv (16,4,k,k) not found"
-kk = dk.shape[2]
-pad = 0 if kk == 2 else 1
-print("deconv kernel=%d stride=2 pad=%d bias=%s" % (kk, pad, db is not None))
-
-W0 = torch.zeros(16, 7, 3, 3)
-with torch.no_grad():
-    W0[:, 0:3] = c0
+print("scale1 conv key:", key96_15, tuple(w96_15.shape) if w96_15 is not None else None)
+assert w96_15 is not None, "scale1 conv (96,15,*,*) not found"
+print("bias:", tuple(b96_15.shape) if b96_15 is not None else None)
 
 
 class Net(nn.Module):
     def __init__(self):
         super().__init__()
-        self.c0 = nn.Conv2d(7, 16, 3, 1, 1)
-        self.c1 = nn.Conv2d(16, 16, 3, 1, 1)
-        self.c2 = nn.Conv2d(16, 16, 3, 1, 1)
-        self.d0 = nn.ConvTranspose2d(16, 4, kk, 2, pad, bias=(db is not None))
+        # 5 входов: img0_down(3), img1_down(3), flow0_up(4), feat0(16), feat1(16)
+        self.conv = nn.Conv2d(15, 96, w96_15.shape[2:], 1, w96_15.shape[2]//2,
+                              bias=(b96_15 is not None))
         with torch.no_grad():
-            self.c0.weight.copy_(W0); self.c0.bias.copy_(b0)
-            self.c1.weight.copy_(c1); self.c1.bias.copy_(b1)
-            self.c2.weight.copy_(c2); self.c2.bias.copy_(b2)
-            self.d0.weight.copy_(dk)
-            if db is not None:
-                self.d0.bias.copy_(db)
+            self.conv.weight.copy_(w96_15)
+            if b96_15 is not None:
+                self.conv.bias.copy_(b96_15)
 
-    def forward(self, x):
-        return self.d0(self.c2(self.c1(self.c0(x))))
+    def forward(self, i0d, i1d, f0u, f0, f1):
+        cat = torch.cat([i0d, i1d, f0u, f0, f1], dim=1)
+        return self.conv(cat)
 
 
 net = Net().eval()
-x = torch.rand(1, 7, 384, 512)
+i0d = torch.rand(1, 3, 192, 256)
+i1d = torch.rand(1, 3, 192, 256)
+f0u = torch.rand(1, 4, 192, 256)
+f0 = torch.rand(1, 16, 192, 256)
+f1 = torch.rand(1, 16, 192, 256)
 with torch.no_grad():
-    y = net(x)
+    y = net(i0d, i1d, f0u, f0, f1)
 print("eager out:", tuple(y.shape))
-assert y.shape[2] == 768 and y.shape[3] == 1024, "deconv must double resolution"
-torch.onnx.export(net, x, "rife_hand.onnx", opset_version=13,
-                  input_names=["in0"], output_names=["out0"],
+assert y.shape[1] == 96
+torch.onnx.export(net, (i0d, i1d, f0u, f0, f1), "rife_hand.onnx", opset_version=13,
+                  input_names=["i0d", "i1d", "f0u", "f0", "f1"], output_names=["out0"],
                   dynamo=False, do_constant_folding=True)
 print("wrote rife_hand.onnx (%d B)" % os.path.getsize("rife_hand.onnx"))
