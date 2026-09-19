@@ -33,7 +33,7 @@ jobs:
           find model_src -maxdepth 3 -type f | sort | head -80
 
       - name: export
-        run: python -u -X faulthandler rife_ncnn_writer.py
+        run: python -u -X faulthandler rife_ncnn_writer.py python rife_warp_emit.py
 
       - name: pnnx
         run: |
@@ -59,4 +59,6 @@ jobs:
             rife_ifnet.ncnn.bin
             rife_rifehdv3.ncnn.param
             rife_rifehdv3.ncnn.bin
+            rife_warp.ncnn.param
+            rife_warp.ncnn.bin
           if-no-files-found: ignore
