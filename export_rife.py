@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 import sys, os, re, glob, types, inspect, importlib.util, importlib.machinery
 import subprocess, shutil, zipfile, traceback
+import faulthandler
+faulthandler.enable()
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,6 +17,8 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 MIN_ONNX_BYTES = 8_000_000
+DUMMY = torch.rand(1, 7, 384, 512)
+SCALE = [32.0, 16.0, 8.0, 4.0, 2.0]
 
 
 def _warp(x, flow):
@@ -31,7 +40,6 @@ def _noop(*a, **k):
 
 
 class _DummyModule(nn.Module):
-    """TorchScript-безопасная заглушка для тренировочных глобалов (EPE, SOBEL, ...)."""
     def __init__(self, *a, **k):
         super().__init__()
 
@@ -157,20 +165,19 @@ pkls = [p for p in
         glob.glob(os.path.join(ROOT, "**", "*.pth"), recursive=True) +
         glob.glob(os.path.join(ROOT, "**", "*.pt"), recursive=True)]
 pkls.sort(key=_pref, reverse=True)
-print("pkl candidates:")
-for p in pkls:
-    print("  ", p, "(%.2f MB, pref=%d)" % (os.path.getsize(p)/1e6, _pref(p)))
-if not pkls:
-    raise SystemExit("no weights found under " + ROOT)
-
-sd_raw = torch.load(pkls[0], map_location="cpu", weights_only=False)
-if isinstance(sd_raw, dict) and "state_dict" in sd_raw:
-    sd_raw = sd_raw["state_dict"]
 
 
-def strip_mod(sd):
+def load_sd():
+    print("pkl candidates:")
+    for p in pkls:
+        print("  ", p, "(%.2f MB, pref=%d)" % (os.path.getsize(p)/1e6, _pref(p)))
+    if not pkls:
+        raise SystemExit("no weights found under " + ROOT)
+    sd_raw = torch.load(pkls[0], map_location="cpu", weights_only=False)
+    if isinstance(sd_raw, dict) and "state_dict" in sd_raw:
+        sd_raw = sd_raw["state_dict"]
     out = {}
-    for k, v in sd.items():
+    for k, v in sd_raw.items():
         k2 = k
         while k2.startswith("module."):
             k2 = k2[len("module."):]
@@ -178,11 +185,10 @@ def strip_mod(sd):
     return out
 
 
-sd_base = strip_mod(sd_raw)
-sd_ifnet = {k: v for k, v in sd_base.items() if not k.startswith("refine.")}
-sd_refine = {k[len("refine."):]: v for k, v in sd_base.items() if k.startswith("refine.")}
-print("weights keys sample:", list(sd_base.keys())[:6])
-print("ifnet keys=%d refine keys=%d" % (len(sd_ifnet), len(sd_refine)))
+SD_BASE = load_sd()
+SD_IFNET = {k: v for k, v in SD_BASE.items() if not k.startswith("refine.")}
+SD_REFINE = {k[len("refine."):]: v for k, v in SD_BASE.items() if k.startswith("refine.")}
+print("ifnet keys=%d refine keys=%d" % (len(SD_IFNET), len(SD_REFINE)))
 
 TARGETS = [
     ("rifehdv3", "RIFE_HDv3.py", ["Model", "RIFE", "RIFE_HDv3"]),
@@ -216,16 +222,11 @@ def _pick(out):
                        (tuple(out.shape) if torch.is_tensor(out) else type(out),))
 
 
-DUMMY = torch.rand(1, 7, 384, 512)
-SCALE = [32.0, 16.0, 8.0, 4.0, 2.0]
-
-
 def make_wrapper_model(net, mod):
     class W(nn.Module):
         def __init__(self):
             super().__init__()
             self.net = net
-            self.mod = mod
 
         def forward(self, x):
             i0 = x[:, 0:3]
@@ -286,20 +287,18 @@ def make_wrapper_ifnet(net):
     return W()
 
 
-produced = []
-for set_name, py_base, class_names in TARGETS:
-    print("\n========== SET %s ==========" % set_name)
+def build_set(set_name):
+    py_base, class_names = {t[0]: (t[1], t[2]) for t in TARGETS}[set_name]
     py = find_py(py_base)
     if py is None:
         print("SKIP: py %s not found" % py_base)
-        continue
+        return None
     print("py:", py)
     try:
         mod = _load_with_stubs(py, "prov_%s" % set_name)
     except Exception as e:
         print("SKIP: import fail ->", e)
-        traceback.print_exc()
-        continue
+        return None
     cls = None
     for cn in class_names:
         if hasattr(mod, cn):
@@ -308,8 +307,7 @@ for set_name, py_base, class_names in TARGETS:
             break
     if cls is None:
         print("SKIP: no class %s" % (class_names,))
-        continue
-
+        return None
     net = None
     for ctor in (lambda: cls(), lambda: cls(-1), lambda: cls(local_rank=-1), lambda: cls(None)):
         try:
@@ -323,66 +321,76 @@ for set_name, py_base, class_names in TARGETS:
             continue
     if net is None:
         print("SKIP: all constructors failed")
-        continue
-
+        return None
     target = getattr(net, "flownet", net)
-    miss, unexp = target.load_state_dict(sd_ifnet, strict=False)
+    miss, unexp = target.load_state_dict(SD_IFNET, strict=False)
     print("  flownet/IFNet load missing=%d unexpected=%d" % (len(miss), len(unexp)))
-    if hasattr(net, "refine") and sd_refine:
-        m2, u2 = net.refine.load_state_dict(sd_refine, strict=False)
+    if hasattr(net, "refine") and SD_REFINE:
+        m2, u2 = net.refine.load_state_dict(SD_REFINE, strict=False)
         print("  refine load missing=%d unexpected=%d" % (len(m2), len(u2)))
     if len(miss) != 0:
         print("SKIP: missing=%d > 0" % len(miss))
-        continue
+        return None
     net.eval()
-
-    convs_28 = [m for m in target.modules() if isinstance(m, nn.Conv2d) and m.in_channels == 28]
-    print("  Conv2d in_channels=28 count=%d" % len(convs_28))
-    seen = {}
-    if convs_28:
-        def hk(m, inp, out):
-            seen.setdefault("ch", []).append(inp[0].shape[1])
-        for c in convs_28:
-            c.register_forward_hook(hk)
-
     w = make_wrapper_model(net, mod) if set_name == "rifehdv3" else make_wrapper_ifnet(net)
     w.eval()
-    try:
-        with torch.no_grad():
-            ref = _call_with_injection(mod, lambda: w(DUMMY))
-    except Exception as e:
-        print("SKIP: forward fail ->", e)
-        traceback.print_exc()
-        continue
-    print("  REF out shape=%s mean=%.4f min=%.4f max=%.4f" %
-          (tuple(ref.shape), float(ref.mean()), float(ref.min()), float(ref.max())))
-    if convs_28:
-        print("  hook in_channels unique:", sorted(set(seen.get("ch", []))))
-    if tuple(ref.shape) != (1, 3, 384, 512):
-        print("SKIP: unexpected ref shape (wanted (1,3,384,512))")
-        continue
-    if not (0.0 <= float(ref.mean()) <= 1.0):
-        print("SKIP: mean out of [0,1]")
-        continue
+    return w
 
+
+def do_export(set_name, kind):
     onnx_path = "rife_%s.onnx" % set_name
     kw = dict(opset_version=13, input_names=["in0"], output_names=["out0"],
               do_constant_folding=True)
+    w = build_set(set_name)
+    if w is None:
+        sys.exit(2)
+    if kind == "legacy":
+        torch.onnx.export(w, DUMMY, onnx_path, dynamo=False, **kw)
+    else:
+        torch.onnx.export(w, DUMMY, onnx_path, **kw)
+    sys.exit(0)
+
+
+if len(sys.argv) > 1 and sys.argv[1] == "child-export":
+    do_export(sys.argv[2], sys.argv[3])
+
+produced = []
+for set_name, py_base, class_names in TARGETS:
+    print("\n========== SET %s ==========" % set_name)
+    w = build_set(set_name)
+    if w is None:
+        continue
     try:
-        try:
-            torch.onnx.export(w, DUMMY, onnx_path, dynamo=False, **kw)
-        except TypeError:
-            torch.onnx.export(w, DUMMY, onnx_path, **kw)
+        with torch.no_grad():
+            ref = _pick(w(DUMMY))
     except Exception as e:
-        print("SKIP: onnx export fail ->", e)
-        traceback.print_exc()
+        print("SKIP: forward fail ->", e)
         continue
-    sz = os.path.getsize(onnx_path)
-    print("  ONNX exported:", onnx_path, "(%.2f MB)" % (sz / 1e6))
-    if sz < MIN_ONNX_BYTES:
-        print("SKIP: ONNX too small (%d B) — weights not embedded; abort set" % sz)
+    print("  REF out shape=%s mean=%.4f min=%.4f max=%.4f" %
+          (tuple(ref.shape), float(ref.mean()), float(ref.min()), float(ref.max())))
+    if tuple(ref.shape) != (1, 3, 384, 512) or not (0.0 <= float(ref.mean()) <= 1.0):
+        print("SKIP: bad REF")
         continue
-    produced.append(set_name)
+    onnx_path = "rife_%s.onnx" % set_name
+    ok = False
+    for kind in ("legacy", "dynamo"):
+        print("  trying onnx export kind=%s (subprocess)..." % kind)
+        r = subprocess.run([sys.executable, "-u", "-X", "faulthandler",
+                            os.path.abspath(__file__), "child-export", set_name, kind])
+        if r.returncode != 0:
+            print("  child-export %s failed rc=%d" % (kind, r.returncode))
+            continue
+        if not os.path.isfile(onnx_path):
+            print("  child-export %s produced no file" % kind)
+            continue
+        sz = os.path.getsize(onnx_path)
+        print("  ONNX exported (%s): %s (%.2f MB)" % (kind, onnx_path, sz/1e6))
+        if sz >= MIN_ONNX_BYTES:
+            ok = True
+            break
+        print("  ONNX too small (%d B) — weights not embedded; trying next kind" % sz)
+    if ok:
+        produced.append(set_name)
 
 pnnx = shutil.which("pnnx") or "pnnx"
 for s in list(produced):
@@ -391,18 +399,13 @@ for s in list(produced):
                        capture_output=True, text=True)
     print("pnnx[%s] rc=%d" % (s, r.returncode))
     if r.returncode != 0:
-        print(r.stdout[-3000:])
-        print(r.stderr[-3000:])
-        produced.remove(s)
-        continue
+        print(r.stdout[-3000:]); print(r.stderr[-3000:])
+        produced.remove(s); continue
     for ext in ("param", "bin"):
         f = "rife_%s.ncnn.%s" % (s, ext)
-        if os.path.isfile(f):
-            print("  pnnx out:", f, "(%.2f MB)" % (os.path.getsize(f)/1e6))
-        else:
-            print("  MISSING:", f)
-            if s in produced:
-                produced.remove(s)
+        print("  pnnx out:", f, "(%.2f MB)" % (os.path.getsize(f)/1e6) if os.path.isfile(f) else " MISSING")
+        if not os.path.isfile(f) and s in produced:
+            produced.remove(s)
 
 print("\n========== PACKING ==========")
 print("PRODUCED SETS:", produced)
@@ -414,6 +417,5 @@ with zipfile.ZipFile("rife_models.zip", "w", zipfile.ZIP_DEFLATED) as z:
             f = "rife_%s.ncnn.%s" % (s, ext)
             if os.path.isfile(f):
                 z.write(f, os.path.join(s, os.path.basename(f)))
-                print("  packed:", os.path.join(s, os.path.basename(f)),
-                      "(%.2f MB)" % (os.path.getsize(f)/1e6))
+                print("  packed:", os.path.join(s, os.path.basename(f)))
 print("ZIP OK: rife_models.zip (%.2f MB)" % (os.path.getsize("rife_models.zip")/1e6))
