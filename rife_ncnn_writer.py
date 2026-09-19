@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Инкремент 2 (v4): scale0 conv-цепочка (3->16->16->16) с корректным
-заголовком param и самопроверкой. Ожидание бисекта: layers=5,
-Crop c=3, conv0/1/2 c=16, ALL LAYERS OK."""
-import struct, os, glob
+"""Инкремент 1 (v5): строим СВОЙ ONNX из весов pkl (scale0: 3 свёртки 16ch),
+затем pnnx даёт param/bin, которые устройство читает гарантированно.
+Первая свёртка расширена 3->7 каналов нулями под 7-канальный вход бисекта.
+Ожидание бисекта: LOAD ok, слои Conv, финал c=16, ALL LAYERS OK."""
+import os, glob
 import torch
+import torch.nn as nn
 
 
 def _pref(p):
@@ -20,6 +22,7 @@ pkls = [p for p in
         glob.glob(os.path.join("model_src", "**", "*.pth"), recursive=True) +
         glob.glob(os.path.join("model_src", "**", "*.pt"), recursive=True)]
 pkls.sort(key=_pref, reverse=True)
+print("pkl:", pkls[:3])
 sd_raw = torch.load(pkls[0], map_location="cpu", weights_only=False)
 if isinstance(sd_raw, dict) and "state_dict" in sd_raw:
     sd_raw = sd_raw["state_dict"]
@@ -30,64 +33,38 @@ for k, v in sd_raw.items():
         k2 = k2[len("module."):]
     sd[k2] = v
 
-convs = []
-for k, v in sd.items():
-    if v.dim() == 4 and tuple(v.shape) in ((16, 3, 3, 3), (16, 16, 3, 3)):
-        b = sd.get(k.replace(".weight", ".bias"))
-        if b is not None and tuple(b.shape) == (16,):
-            convs.append((k, v, b))
-    if len(convs) == 3:
-        break
-print("picked convs:", [(k, tuple(w.shape)) for k, w, _ in convs])
-assert len(convs) == 3 and tuple(convs[0][1].shape) == (16, 3, 3, 3)
+c0, b0 = sd["encode.cnn0.weight"], sd["encode.cnn0.bias"]
+c1, b1 = sd["encode.cnn1.weight"], sd["encode.cnn1.bias"]
+c2, b2 = sd["encode.cnn2.weight"], sd["encode.cnn2.bias"]
+print("picked:", tuple(c0.shape), tuple(c1.shape), tuple(c2.shape))
+assert tuple(c0.shape) == (16, 3, 3, 3)
 
-# список слоёв: (type, name, bottoms, tops, params)
-layers = [
-    ("Input", "in0", [], ["in0"], ""),
-    ("Crop", "crop0", ["in0"], ["c0"], "2=0 5=3"),
-]
-prev = "c0"
-blobs = ["in0", "c0"]
-for i, (k, w, b) in enumerate(convs):
-    out = "f%d" % i
-    layers.append(("Convolution", "conv%d" % i, [prev], [out],
-                   "0=16 1=3 5=1 6=%d" % w.numel()))
-    prev = out
-    blobs.append(out)
-
-param_path = "rife_hand.ncnn.param"
-bin_path = "rife_hand.ncnn.bin"
-with open(param_path, "w") as f:
-    f.write("7767577\n")
-    f.write("%d %d\n" % (len(layers), len(blobs)))
-    for typ, name, bottoms, tops, params in layers:
-        f.write("%s %s %d %d %s %s%s\n" % (
-            typ, name, len(bottoms), len(tops),
-            " ".join(bottoms + tops),
-            (" " + params) if params else "",
-            ""))
+W0 = torch.zeros(16, 7, 3, 3)
+with torch.no_grad():
+    W0[:, 0:3] = c0
 
 
-def wblob(f, t):
-    a = t.detach().cpu().contiguous()
-    f.write(struct.pack("<i", 0))
-    f.write(a.numpy().astype("<f4").tobytes())
+class Net(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.c0 = nn.Conv2d(7, 16, 3, 1, 1)
+        self.c1 = nn.Conv2d(16, 16, 3, 1, 1)
+        self.c2 = nn.Conv2d(16, 16, 3, 1, 1)
+        with torch.no_grad():
+            self.c0.weight.copy_(W0); self.c0.bias.copy_(b0)
+            self.c1.weight.copy_(c1); self.c1.bias.copy_(b1)
+            self.c2.weight.copy_(c2); self.c2.bias.copy_(b2)
+
+    def forward(self, x):
+        return self.c2(self.c1(self.c0(x)))
 
 
-with open(bin_path, "wb") as f:
-    for k, w, b in convs:
-        wblob(f, w)
-        wblob(f, b)
-
-# самопроверка: magic и счётчики
-with open(param_path, "rb") as f:
-    head = f.read(64)
-print("param head bytes:", head[:24])
-first = head.split(b"\n", 1)[0].strip()
-assert first == b"7767577", "BAD MAGIC: %r" % first
-print("param lines head:")
-for ln in head.decode("utf-8", "replace").splitlines()[:4]:
-    print("   |", ln)
-print("wrote %s (%d B) and %s (%d B)" % (
-    param_path, os.path.getsize(param_path),
-    bin_path, os.path.getsize(bin_path)))
+net = Net().eval()
+x = torch.rand(1, 7, 384, 512)
+with torch.no_grad():
+    y = net(x)
+print("eager out:", tuple(y.shape), "mean=%.4f" % float(y.mean()))
+torch.onnx.export(net, x, "rife_hand.onnx", opset_version=13,
+                  input_names=["in0"], output_names=["out0"],
+                  dynamo=False, do_constant_folding=True)
+print("wrote rife_hand.onnx (%d B)" % os.path.getsize("rife_hand.onnx"))
