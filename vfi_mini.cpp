@@ -281,15 +281,8 @@ static void register_all(ncnn::Net& net) {
     net.register_custom_layer("rife.Warp", Warp_layer_creator);
 }
 
-static int run_net(bool warp_gpu, bool use_vulkan,
-                   const char* param, const char* bin,
-                   int W, int H, int runs, const char* label) {
-    g_warp_gpu = warp_gpu;
-    int threads; bool fp16;
-    parse_opt(getenv("VFI_OPT"), threads, fp16);
-    printf("opt: thr=%d fp16=%d vulkan=%d reshmode=%d\n",
-           threads, fp16 ? 1 : 0, use_vulkan ? 1 : 0, g_reshmode);
-    ncnn::Net net;
+static bool build_net(ncnn::Net& net, bool use_vulkan, int threads, bool fp16,
+                      const char* param, const char* bin) {
     net.opt.use_vulkan_compute = use_vulkan;
     if (use_vulkan) net.set_vulkan_device(0);
     net.opt.use_fp16_packed = fp16;
@@ -298,24 +291,17 @@ static int run_net(bool warp_gpu, bool use_vulkan,
     net.opt.use_packing_layout = false;
     net.opt.num_threads = threads;
     register_all(net);
-    g_phase = "load";
-    fprintf(stderr, "LOAD: param %s\n", param); fflush(stderr);
-    if (net.load_param(param) != 0) { fprintf(stderr, "ERR: load_param failed\n"); fflush(NULL); return 2; }
+    fprintf(stderr, "LOAD: param %s (vulkan=%d)\n", param, use_vulkan ? 1 : 0); fflush(stderr);
+    if (net.load_param(param) != 0) { fprintf(stderr, "ERR: load_param failed\n"); fflush(stderr); return false; }
     fprintf(stderr, "LOAD: param ok layers=%d\n", (int)net.layers().size()); fflush(stderr);
     fprintf(stderr, "LOAD: model %s\n", bin); fflush(stderr);
-    if (net.load_model(bin) != 0) { fprintf(stderr, "ERR: load_model failed\n"); fflush(NULL); return 2; }
+    if (net.load_model(bin) != 0) { fprintf(stderr, "ERR: load_model failed\n"); fflush(stderr); return false; }
     fprintf(stderr, "LOAD: model ok\n"); fflush(stderr);
-    ncnn::Mat a(W, H, 3), b(W, H, 3);
-    for (int c = 0; c < 3; c++) {
-        float* pa = a.channel(c); float* pb = b.channel(c);
-        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
-            pa[y*W+x] = fmodf((x + c * 37.0f) / 255.0f, 1.0f);
-            pb[y*W+x] = fmodf((x + y + c * 37.0f) / 255.0f, 1.0f);
-        }
-    }
-    ncnn::Mat ts(1, 1, 1); ts.channel(0)[0] = 0.5f;
-    const std::vector<int>& ins = net.input_indexes();
-    printf("inputs=%d\n", (int)ins.size());
+    return true;
+}
+
+static int probe_child(ncnn::Net& net, int c_in, int W, int H,
+                       const ncnn::Mat& a, const ncnn::Mat& b) {
     auto make_input = [&](int ci) {
         ncnn::Mat in(W, H, ci);
         for (int c = 0; c < ci; c++) {
@@ -327,26 +313,79 @@ static int run_net(bool warp_gpu, bool use_vulkan,
         }
         return in;
     };
-    g_phase = "probe";
-    int c_in = 0;
-    if ((int)ins.size() == 1) {
-        const int cands[4] = {7, 6, 11, 4};
-        for (int k = 0; k < 4; k++) {
-            pid_t pid = fork();
-            if (pid == 0) {
-                ncnn::Extractor ex2 = net.create_extractor();
-                ex2.input(ins[0], make_input(cands[k]));
-                ncnn::Mat o;
-                int r = ex2.extract(net.output_indexes()[0], o);
-                fflush(NULL);
-                _exit(r == 0 ? 0 : 1);
-            }
-            int st = 0; waitpid(pid, &st, 0);
-            if (WIFEXITED(st) && WEXITSTATUS(st) == 0) { c_in = cands[k]; break; }
-        }
-        if (c_in == 0) { fprintf(stderr, "ERR: no feed contract worked\n"); fflush(NULL); return 3; }
-        printf("single-input contract c_in=%d\n", c_in);
+    pid_t pid = fork();
+    if (pid == 0) {
+        ncnn::Extractor ex2 = net.create_extractor();
+        ex2.input(net.input_indexes()[0], make_input(c_in));
+        ncnn::Mat o;
+        int r = ex2.extract(net.output_indexes()[0], o);
+        fflush(NULL);
+        _exit(r == 0 ? 0 : 1);
     }
+    int st = 0; waitpid(pid, &st, 0);
+    if (WIFSIGNALED(st)) return -WTERMSIG(st);
+    if (WIFEXITED(st)) return WEXITSTATUS(st) == 0 ? 0 : 100 + WEXITSTATUS(st);
+    return -1;
+}
+
+static int run_net(bool warp_gpu, bool use_vulkan_pref,
+                   const char* param, const char* bin,
+                   int W, int H, int runs, const char* label) {
+    g_warp_gpu = warp_gpu;
+    int threads; bool fp16;
+    parse_opt(getenv("VFI_OPT"), threads, fp16);
+    printf("opt: thr=%d fp16=%d vulkan_pref=%d reshmode=%d\n",
+           threads, fp16 ? 1 : 0, use_vulkan_pref ? 1 : 0, g_reshmode);
+    ncnn::Mat a(W, H, 3), b(W, H, 3);
+    for (int c = 0; c < 3; c++) {
+        float* pa = a.channel(c); float* pb = b.channel(c);
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+            pa[y*W+x] = fmodf((x + c * 37.0f) / 255.0f, 1.0f);
+            pb[y*W+x] = fmodf((x + y + c * 37.0f) / 255.0f, 1.0f);
+        }
+    }
+    ncnn::Mat ts(1, 1, 1); ts.channel(0)[0] = 0.5f;
+
+    ncnn::Net net;
+    bool loaded = false;
+    bool used_vulkan = false;
+    int c_in = 0;
+    const bool vk_order[2] = {use_vulkan_pref, !use_vulkan_pref};
+    for (int k = 0; k < 2 && !loaded; k++) {
+        const bool vk = vk_order[k];
+        if (vk && ncnn::get_gpu_count() == 0) continue;
+        ncnn::Net candidate;
+        g_phase = "load";
+        if (!build_net(candidate, vk, threads, fp16, param, bin)) continue;
+        g_phase = "probe";
+        const std::vector<int>& ins = candidate.input_indexes();
+        printf("inputs=%d vulkan=%d\n", (int)ins.size(), vk ? 1 : 0);
+        if ((int)ins.size() != 1) { loaded = true; used_vulkan = vk; c_in = 0; net = std::move(candidate); break; }
+        const int cands[4] = {7, 6, 11, 4};
+        for (int ci = 0; ci < 4; ci++) {
+            int st = probe_child(candidate, cands[ci], W, H, a, b);
+            printf("PROBE vulkan=%d c=%d status=%d\n", vk ? 1 : 0, cands[ci], st);
+            fflush(NULL);
+            if (st == 0) { c_in = cands[ci]; break; }
+        }
+        if (c_in != 0) { loaded = true; used_vulkan = vk; net = std::move(candidate); break; }
+        fprintf(stderr, "PROBE: all candidates failed for vulkan=%d\n", vk ? 1 : 0); fflush(stderr);
+    }
+    if (!loaded) { fprintf(stderr, "ERR: no feed contract worked\n"); fflush(NULL); return 3; }
+    printf("contract: vulkan=%d c_in=%d\n", used_vulkan ? 1 : 0, c_in);
+
+    const std::vector<int>& ins = net.input_indexes();
+    auto make_input = [&](int ci) {
+        ncnn::Mat in(W, H, ci);
+        for (int c = 0; c < ci; c++) {
+            float* p = in.channel(c);
+            if (c < 3) memcpy(p, a.channel(c), (size_t)W * H * 4);
+            else if (c < 6) memcpy(p, b.channel(c - 3), (size_t)W * H * 4);
+            else if (c == 6) { for (int i = 0; i < W * H; i++) p[i] = 0.5f; }
+            else memset(p, 0, (size_t)W * H * 4);
+        }
+        return in;
+    };
     auto feed = [&](ncnn::Extractor& ex) {
         if ((int)ins.size() >= 2) {
             ex.input(ins[0], a); ex.input(ins[1], b);
@@ -391,24 +430,13 @@ static int run_net(bool warp_gpu, bool use_vulkan,
 static int bisect(const char* param, const char* bin, int W, int H) {
     int threads; bool fp16;
     parse_opt(getenv("VFI_OPT"), threads, fp16);
+    const bool use_cpu = getenv("VFI_BISECT_CPU") && atoi(getenv("VFI_BISECT_CPU")) == 1;
     ncnn::Net net;
-    net.opt.use_vulkan_compute = false;
-    net.opt.use_fp16_packed = fp16;
-    net.opt.use_fp16_storage = fp16;
-    net.opt.use_fp16_arithmetic = false;
-    net.opt.use_packing_layout = false;
-    net.opt.num_threads = threads;
-    register_all(net);
     g_phase = "load";
-    fprintf(stderr, "LOAD: param %s\n", param); fflush(stderr);
-    if (net.load_param(param) != 0) { fprintf(stderr, "ERR: load_param failed in bisect\n"); fflush(NULL); return 2; }
-    fprintf(stderr, "LOAD: param ok layers=%d\n", (int)net.layers().size()); fflush(stderr);
-    fprintf(stderr, "LOAD: model %s\n", bin); fflush(stderr);
-    if (net.load_model(bin) != 0) { fprintf(stderr, "ERR: load_model failed in bisect\n"); fflush(NULL); return 2; }
-    fprintf(stderr, "LOAD: model ok\n"); fflush(stderr);
+    if (!build_net(net, !use_cpu, threads, fp16, param, bin)) return 2;
     const std::vector<ncnn::Layer*>& lrs = net.layers();
     const int n = (int)lrs.size();
-    printf("bisect: layers=%d (single-pass, cpu)\n", n);
+    printf("bisect: layers=%d (single-pass, vulkan=%d)\n", n, use_cpu ? 0 : 1);
     fflush(NULL);
     ncnn::Mat in(W, H, 7);
     for (int c = 0; c < 7; c++) {
