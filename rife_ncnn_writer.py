@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""v16: ПОЛНАЯ RIFE v4.26 своим конвертером (single-input 7ch -> 3ch).
-Рекурренсия снята хуками: scale0 encode x2 -> cat1(15) -> block0..block4,
-warp через F.grid_sample, финал = w0*mask + w1*(1-mask)."""
+"""v17: ПОЛНАЯ RIFE v4.26 своим конвертером (single-input 7ch -> 3ch).
+encode x2 -> cat1(15) -> block0..block4 (warp через F.grid_sample),
+финал = w0*mask + w1*(1-mask). Экспорт opset 16 (GridSample)."""
 import os, glob
 import torch
 import torch.nn as nn
@@ -22,6 +22,7 @@ pkls = [p for p in
         glob.glob(os.path.join("model_src", "**", "*.pth"), recursive=True) +
         glob.glob(os.path.join("model_src", "**", "*.pt"), recursive=True)]
 pkls.sort(key=_pref, reverse=True)
+print("pkl:", pkls[:3])
 sd_raw = torch.load(pkls[0], map_location="cpu", weights_only=False)
 if isinstance(sd_raw, dict) and "state_dict" in sd_raw:
     sd_raw = sd_raw["state_dict"]
@@ -161,7 +162,7 @@ with torch.no_grad():
 print("eager out:", tuple(y.shape), "mean=%.4f min=%.4f max=%.4f"
       % (float(y.mean()), float(y.min()), float(y.max())))
 assert tuple(y.shape) == (1, 3, 384, 512)
-torch.onnx.export(net, x, "rife_hand.onnx", opset_version=13,
+torch.onnx.export(net, x, "rife_hand.onnx", opset_version=16,
                   input_names=["in0"], output_names=["out0"],
                   dynamo=False, do_constant_folding=True)
 print("wrote rife_hand.onnx (%d B)" % os.path.getsize("rife_hand.onnx"))
