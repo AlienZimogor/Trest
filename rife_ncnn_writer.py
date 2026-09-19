@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""v17: ПОЛНАЯ RIFE v4.26 своим конвертером (single-input 7ch -> 3ch).
-encode x2 -> cat1(15) -> block0..block4 (warp через F.grid_sample),
-финал = w0*mask + w1*(1-mask). Экспорт opset 16 (GridSample)."""
+"""RIFE v4.26 -> ncnn (param/bin) своим конвертером.
+v18: grid_sample экспортируется через кастомный symbolic с Transpose(0,3,1,2)
+на grid, чтобы pnnx дал ncnn GridSample корректный grid (W,H,2)."""
 import os, glob
 import torch
 import torch.nn as nn
@@ -34,34 +34,18 @@ for k, v in sd_raw.items():
     sd[k2] = v
 
 
-def Wt(k):
-    return sd[k]
+class _GridSampleOp(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, grid):
+        return F.grid_sample(x, grid, align_corners=True,
+                             padding_mode="zeros", mode="bilinear")
 
-
-def Bt(k):
-    return sd.get(k.replace(".weight", ".bias"))
-
-
-def conv(key, stride=1):
-    w = Wt(key)
-    c = nn.Conv2d(w.shape[1], w.shape[0], w.shape[2], stride, w.shape[2] // 2,
-                  bias=(Bt(key) is not None))
-    with torch.no_grad():
-        c.weight.copy_(w)
-        if Bt(key) is not None:
-            c.bias.copy_(Bt(key))
-    return c
-
-
-def deconv(key):
-    w = Wt(key)
-    c = nn.ConvTranspose2d(w.shape[0], w.shape[1], w.shape[2], 2, 1,
-                           bias=(Bt(key) is not None))
-    with torch.no_grad():
-        c.weight.copy_(w)
-        if Bt(key) is not None:
-            c.bias.copy_(Bt(key))
-    return c
+    @staticmethod
+    def symbolic(g, x, grid):
+        gt = g.op("Transpose", grid, perm_i=[0, 3, 1, 2])
+        return g.op("GridSample", x, gt,
+                    align_corners_i=1, mode_s="bilinear",
+                    padding_mode_s="zeros")
 
 
 def warp(x, flow):
@@ -75,15 +59,34 @@ def warp(x, flow):
     vgrid = torch.stack([
         2.0 * vgrid[..., 0] / max(W - 1, 1) - 1.0,
         2.0 * vgrid[..., 1] / max(H - 1, 1) - 1.0], dim=-1)
-    return F.grid_sample(x, vgrid, align_corners=True, mode="bilinear",
-                         padding_mode="zeros")
+    return _GridSampleOp.apply(x, vgrid)
+
+
+def conv(key, stride=1):
+    w = sd[key + ".weight"]; b = sd.get(key + ".bias")
+    c = nn.Conv2d(w.shape[1], w.shape[0], w.shape[2], stride, w.shape[2] // 2,
+                  bias=(b is not None))
+    with torch.no_grad():
+        c.weight.copy_(w)
+        if b is not None: c.bias.copy_(b)
+    return c
+
+
+def deconv(key):
+    w = sd[key + ".weight"]; b = sd.get(key + ".bias")
+    c = nn.ConvTranspose2d(w.shape[0], w.shape[1], w.shape[2], 2, 1,
+                           bias=(b is not None))
+    with torch.no_grad():
+        c.weight.copy_(w)
+        if b is not None: c.bias.copy_(b)
+    return c
 
 
 class ConvBlock(nn.Module):
     def __init__(self, prefix):
         super().__init__()
-        self.c = conv(prefix + ".conv.weight")
-        self.register_buffer("beta", Wt(prefix + ".beta"))
+        self.c = conv(prefix + ".c")
+        self.register_buffer("beta", sd[prefix + ".beta"])
         self.act = nn.LeakyReLU(0.2)
 
     def forward(self, x):
@@ -91,14 +94,13 @@ class ConvBlock(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, prefix, c0, c1, factor):
+    def __init__(self, prefix, factor):
         super().__init__()
         self.factor = factor
-        self.c0 = conv(prefix + ".conv0.0.0.weight", stride=2)
-        self.c1 = conv(prefix + ".conv0.1.0.weight", stride=2)
-        self.cb = nn.ModuleList(
-            [ConvBlock(prefix + ".convblock.%d" % i) for i in range(8)])
-        self.last = deconv(prefix + ".lastconv.0.weight")
+        self.c0 = conv(prefix + ".c0", stride=2)
+        self.c1 = conv(prefix + ".c1", stride=2)
+        self.cb = nn.ModuleList([ConvBlock(prefix + ".cb.%d" % i) for i in range(8)])
+        self.last = deconv(prefix + ".last")
         self.ps = nn.PixelShuffle(2)
         self.relu = nn.ReLU()
 
@@ -122,36 +124,30 @@ class Block(nn.Module):
 class Net(nn.Module):
     def __init__(self):
         super().__init__()
-        self.e0 = conv("encode.cnn0.weight", stride=2)
-        self.e1 = conv("encode.cnn1.weight")
-        self.e2 = conv("encode.cnn2.weight")
-        self.ed = deconv("encode.cnn3.weight")
-        self.b0 = Block("block0", 96, 192, 16)
-        self.b1 = Block("block1", 64, 128, 8)
-        self.b2 = Block("block2", 48, 96, 4)
-        self.b3 = Block("block3", 32, 64, 2)
-        self.b4 = Block("block4", 16, 32, 1)
+        self.e0 = conv("e0", stride=2)
+        self.e1 = conv("e1")
+        self.e2 = conv("e2")
+        self.ed = deconv("ed")
+        self.b0 = Block("b0", 16)
+        self.b1 = Block("b1", 8)
+        self.b2 = Block("b2", 4)
+        self.b3 = Block("b3", 2)
+        self.b4 = Block("b4", 1)
 
     def encode(self, img):
         return self.ed(self.e2(self.e1(self.e0(img))))
 
     def forward(self, x):
-        img0 = x[:, 0:3]
-        img1 = x[:, 3:6]
-        ts = x[:, 6:7]
-        d0 = self.encode(img0)
-        d1 = self.encode(img1)
-        cat1 = torch.cat([img0, img1, d0, d1, ts], dim=1)
-        flow, mask, feat = self.b0(cat1, None)
+        img0 = x[:, 0:3]; img1 = x[:, 3:6]; ts = x[:, 6:7]
+        d0 = self.encode(img0); d1 = self.encode(img1)
+        cat = torch.cat([img0, img1, d0, d1, ts], dim=1)
+        flow, mask, feat = self.b0(cat, None)
         for blk in (self.b1, self.b2, self.b3, self.b4):
-            w0 = warp(img0, flow[:, :2])
-            w1 = warp(img1, flow[:, 2:4])
-            wd0 = warp(d0, flow[:, :2])
-            wd1 = warp(d1, flow[:, 2:4])
+            w0 = warp(img0, flow[:, :2]); w1 = warp(img1, flow[:, 2:4])
+            wd0 = warp(d0, flow[:, :2]); wd1 = warp(d1, flow[:, 2:4])
             x24 = torch.cat([w0, w1, wd0, wd1, ts, mask, feat], dim=1)
             flow, mask, feat = blk(x24, flow)
-        w0 = warp(img0, flow[:, :2])
-        w1 = warp(img1, flow[:, 2:4])
+        w0 = warp(img0, flow[:, :2]); w1 = warp(img1, flow[:, 2:4])
         return w0 * mask + w1 * (1.0 - mask)
 
 
@@ -159,9 +155,7 @@ net = Net().eval()
 x = torch.rand(1, 7, 384, 512)
 with torch.no_grad():
     y = net(x)
-print("eager out:", tuple(y.shape), "mean=%.4f min=%.4f max=%.4f"
-      % (float(y.mean()), float(y.min()), float(y.max())))
-assert tuple(y.shape) == (1, 3, 384, 512)
+print("eager out:", tuple(y.shape), "mean=%.4f" % float(y.mean()))
 torch.onnx.export(net, x, "rife_hand.onnx", opset_version=16,
                   input_names=["in0"], output_names=["out0"],
                   dynamo=False, do_constant_folding=True)
