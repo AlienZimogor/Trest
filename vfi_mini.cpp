@@ -288,6 +288,7 @@ void main() {
 class Warp_layer : public ncnn::Layer {
 public:
     ncnn::Pipeline* pipeline;
+    mutable bool logged = false;
     Warp_layer() {
         pipeline = 0;
         support_vulkan = g_warp_gpu;
@@ -322,6 +323,12 @@ public:
         const ncnn::Mat& x = bottom_blobs[0];
         const ncnn::Mat& flow = bottom_blobs[1];
         const int w = x.w, h = x.h, ch = x.c;
+        if (!logged) {
+            fprintf(stderr, "WARP %s x=%dx%dx%d flow=%dx%dx%d\n",
+                    name.c_str(), w, h, ch, flow.w, flow.h, flow.c);
+            fflush(stderr);
+            logged = true;
+        }
         if (flow.c != 2 || flow.w < w || flow.h < h) return -100;
         const int oy = (flow.h - h) / 2;
         const int ox = (flow.w - w) / 2;
