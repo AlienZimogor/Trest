@@ -34,7 +34,7 @@ jobs:
           find model_src -maxdepth 3 -type f | sort | head -80
 
       - name: export
-        run: python -u -X faulthandler export_rife.py
+        run: python -u -X faulthandler rife_ncnn_writer.py
 
       - name: pnnx
         run: |
@@ -56,6 +56,8 @@ jobs:
           name: rife-models
           path: |
             rife_models.zip
+            rife_hand.ncnn.param
+            rife_hand.ncnn.bin
             rife_ifnet.onnx
             rife_ifnet.ncnn.param
             rife_ifnet.ncnn.bin
