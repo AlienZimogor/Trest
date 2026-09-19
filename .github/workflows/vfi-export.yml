@@ -34,7 +34,7 @@ jobs:
           find model_src -maxdepth 3 -type f | sort | head -80
 
       - name: export
-        run: python export_rife.py
+        run: python -u -X faulthandler export_rife.py
 
       - name: pnnx
         run: |
