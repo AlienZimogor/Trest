@@ -21,6 +21,7 @@ static double now_ms() {
 }
 
 static bool g_warp_gpu = false;
+static int g_reshmode = 1;
 
 static std::atomic<int> g_frame{0};
 static std::atomic<int> g_frames{0};
@@ -218,27 +219,8 @@ public:
     virtual int destroy_pipeline(const ncnn::Option& opt) {
         delete pipeline; pipeline = 0; return 0;
     }
-    virtual int forward_gpu(const std::vector<ncnn::VkMat>& bottom_blobs,
-                            std::vector<ncnn::VkMat>& top_blobs,
-                            ncnn::VkCompute& cmd,
-                            const ncnn::Option& opt) const {
-        const ncnn::VkMat& x = bottom_blobs[0];
-        const ncnn::VkMat& flow = bottom_blobs[1];
-        const int w = x.w, h = x.h, ch = x.c;
-        if (flow.c != 2 || flow.w < w || flow.h < h) return -100;
-        if (x.elemsize != 4u || flow.elemsize != 4u ||
-            x.elempack != 1 || flow.elempack != 1) return -101;
-        ncnn::VkMat& top = top_blobs[0];
-        top.create(w, h, ch, 4u, 1, opt.blob_vkallocator);
-        if (top.empty()) return -100;
-        std::vector<ncnn::VkMat> bindings(3);
-        bindings[0] = x; bindings[1] = flow; bindings[2] = top;
-        std::vector<ncnn::vk_constant_type> k(7);
-        k[0].i = w; k[1].i = h; k[2].i = flow.w; k[3].i = flow.h;
-        k[4].i = (flow.w - w) / 2; k[5].i = (flow.h - h) / 2; k[6].i = ch;
-        cmd.record_pipeline(pipeline, bindings, k, top);
-        return 0;
-    }
+    virtual int forward_gpu(const std::vector<ncnn::VkMat>&, std::vector<ncnn::VkMat>&,
+                            ncnn::VkCompute&, const ncnn::Option&) const { return -100; }
     virtual int forward(const std::vector<ncnn::Mat>& bottom_blobs,
                         std::vector<ncnn::Mat>& top_blobs,
                         const ncnn::Option& opt) const {
@@ -305,7 +287,8 @@ static int run_net(bool warp_gpu, bool use_vulkan,
     g_warp_gpu = warp_gpu;
     int threads; bool fp16;
     parse_opt(getenv("VFI_OPT"), threads, fp16);
-    printf("opt: thr=%d fp16=%d vulkan=%d\n", threads, fp16 ? 1 : 0, use_vulkan ? 1 : 0);
+    printf("opt: thr=%d fp16=%d vulkan=%d reshmode=%d\n",
+           threads, fp16 ? 1 : 0, use_vulkan ? 1 : 0, g_reshmode);
     ncnn::Net net;
     net.opt.use_vulkan_compute = use_vulkan;
     if (use_vulkan) net.set_vulkan_device(0);
@@ -316,8 +299,12 @@ static int run_net(bool warp_gpu, bool use_vulkan,
     net.opt.num_threads = threads;
     register_all(net);
     g_phase = "load";
+    fprintf(stderr, "LOAD: param %s\n", param); fflush(stderr);
     if (net.load_param(param) != 0) { fprintf(stderr, "ERR: load_param failed\n"); fflush(NULL); return 2; }
+    fprintf(stderr, "LOAD: param ok layers=%d\n", (int)net.layers().size()); fflush(stderr);
+    fprintf(stderr, "LOAD: model %s\n", bin); fflush(stderr);
     if (net.load_model(bin) != 0) { fprintf(stderr, "ERR: load_model failed\n"); fflush(NULL); return 2; }
+    fprintf(stderr, "LOAD: model ok\n"); fflush(stderr);
     ncnn::Mat a(W, H, 3), b(W, H, 3);
     for (int c = 0; c < 3; c++) {
         float* pa = a.channel(c); float* pb = b.channel(c);
@@ -413,8 +400,12 @@ static int bisect(const char* param, const char* bin, int W, int H) {
     net.opt.num_threads = threads;
     register_all(net);
     g_phase = "load";
+    fprintf(stderr, "LOAD: param %s\n", param); fflush(stderr);
     if (net.load_param(param) != 0) { fprintf(stderr, "ERR: load_param failed in bisect\n"); fflush(NULL); return 2; }
+    fprintf(stderr, "LOAD: param ok layers=%d\n", (int)net.layers().size()); fflush(stderr);
+    fprintf(stderr, "LOAD: model %s\n", bin); fflush(stderr);
     if (net.load_model(bin) != 0) { fprintf(stderr, "ERR: load_model failed in bisect\n"); fflush(NULL); return 2; }
+    fprintf(stderr, "LOAD: model ok\n"); fflush(stderr);
     const std::vector<ncnn::Layer*>& lrs = net.layers();
     const int n = (int)lrs.size();
     printf("bisect: layers=%d (single-pass, cpu)\n", n);
@@ -467,7 +458,7 @@ int main(int argc, char** argv) {
     const char* param = argc > 1 ? argv[1] : "flownet.param";
     const char* bin   = argc > 2 ? argv[2] : "flownet.bin";
     int W = argc > 3 ? atoi(argv[3]) : 512;
-    int H = argc > 4 ? atoi(argv[4]) : 320;
+    int H = argc > 4 ? atoi(argv[4]) : 384;
     int runs = argc > 5 ? atoi(argv[5]) : 5;
     const char* mode = argc > 6 ? argv[6] : "gpu";
     if (strcmp(mode, "bisect") == 0) return bisect(param, bin, W, H);
