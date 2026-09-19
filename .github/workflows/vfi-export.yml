@@ -35,10 +35,9 @@ jobs:
       - name: export
         run: python -u -X faulthandler rife_ncnn_writer.py
 
-      - name: pnnx
+      - name: pnnx + surgery
         run: |
           set -e
-          ls -la *.onnx
           echo "=== running pnnx on rife_hand.onnx ==="
           pnnx rife_hand.onnx inputshape=[1,7,384,512]
           echo "=== LAYER TYPES before surgery ==="
@@ -49,11 +48,24 @@ jobs:
           awk 'NR>2 {print $1}' rife_hand.ncnn.param | sort | uniq -c | sort -rn
           head -12 rife_hand.ncnn.param
 
+      - name: repack zip (post-surgery)
+        run: |
+          set -e
+          rm -f rife_models.zip
+          mkdir -p zipstage/hand
+          cp rife_hand.ncnn.param zipstage/hand/
+          cp rife_hand.ncnn.bin   zipstage/hand/
+          cd zipstage
+          zip -r ../rife_models.zip hand
+          cd ..
+          unzip -l rife_models.zip
+
       - uses: actions/upload-artifact@v4
         with:
           name: rife-models
           path: |
+            rife_models.zip
             rife_hand.onnx
             rife_hand.ncnn.param
             rife_hand.ncnn.bin
-          if-no-files-found: ignore
+          if-no-files-found: error
