@@ -1,11 +1,69 @@
 #!/usr/bin/env python3
-"""v15: диагностика рекурренсии — tuple-безопасные хуки на block0..block4
-(вход-cat и выходы flow/mask/feat) + conv0/lastconv каждого блока."""
-import os, sys, glob, types, re, importlib.util, importlib.machinery
+"""v16: ПОЛНАЯ RIFE v4.26 своим конвертером (single-input 7ch -> 3ch).
+Рекурренсия снята хуками: scale0 encode x2 -> cat1(15) -> block0..block4,
+warp через F.grid_sample, финал = w0*mask + w1*(1-mask)."""
+import os, glob
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
-def _warp(x, flow):
+def _pref(p):
+    s = 0
+    b = os.path.basename(p).lower()
+    if "4.26" in b or "426" in b: s += 4
+    if "v4" in b: s += 1
+    if "flownet" in b: s -= 3
+    return s
+
+
+pkls = [p for p in
+        glob.glob(os.path.join("model_src", "**", "*.pkl"), recursive=True) +
+        glob.glob(os.path.join("model_src", "**", "*.pth"), recursive=True) +
+        glob.glob(os.path.join("model_src", "**", "*.pt"), recursive=True)]
+pkls.sort(key=_pref, reverse=True)
+sd_raw = torch.load(pkls[0], map_location="cpu", weights_only=False)
+if isinstance(sd_raw, dict) and "state_dict" in sd_raw:
+    sd_raw = sd_raw["state_dict"]
+sd = {}
+for k, v in sd_raw.items():
+    k2 = k
+    while k2.startswith("module."):
+        k2 = k2[len("module."):]
+    sd[k2] = v
+
+
+def Wt(k):
+    return sd[k]
+
+
+def Bt(k):
+    return sd.get(k.replace(".weight", ".bias"))
+
+
+def conv(key, stride=1):
+    w = Wt(key)
+    c = nn.Conv2d(w.shape[1], w.shape[0], w.shape[2], stride, w.shape[2] // 2,
+                  bias=(Bt(key) is not None))
+    with torch.no_grad():
+        c.weight.copy_(w)
+        if Bt(key) is not None:
+            c.bias.copy_(Bt(key))
+    return c
+
+
+def deconv(key):
+    w = Wt(key)
+    c = nn.ConvTranspose2d(w.shape[0], w.shape[1], w.shape[2], 2, 1,
+                           bias=(Bt(key) is not None))
+    with torch.no_grad():
+        c.weight.copy_(w)
+        if Bt(key) is not None:
+            c.bias.copy_(Bt(key))
+    return c
+
+
+def warp(x, flow):
     N, C, H, W = x.shape
     ys = torch.arange(H, device=x.device, dtype=x.dtype)
     xs = torch.arange(W, device=x.device, dtype=x.dtype)
@@ -16,151 +74,94 @@ def _warp(x, flow):
     vgrid = torch.stack([
         2.0 * vgrid[..., 0] / max(W - 1, 1) - 1.0,
         2.0 * vgrid[..., 1] / max(H - 1, 1) - 1.0], dim=-1)
-    return torch.nn.functional.grid_sample(x, vgrid, align_corners=True)
+    return F.grid_sample(x, vgrid, align_corners=True, mode="bilinear",
+                         padding_mode="zeros")
 
 
-def _noop(*a, **k):
-    return None
-
-
-class _DummyModule(torch.nn.Module):
-    def __init__(self, *a, **k):
+class ConvBlock(nn.Module):
+    def __init__(self, prefix):
         super().__init__()
+        self.c = conv(prefix + ".conv.weight")
+        self.register_buffer("beta", Wt(prefix + ".beta"))
+        self.act = nn.LeakyReLU(0.2)
 
-    def forward(self, *a, **k):
-        return torch.zeros(1)
-
-
-def _finish(mod, name):
-    spec = importlib.machinery.ModuleSpec(name, loader=None, is_package=True)
-    mod.__spec__ = spec
-    mod.__file__ = "<stub:%s>" % name
-    mod.__loader__ = None
-    mod.__path__ = []
-    mod.__all__ = []
-    return mod
+    def forward(self, x):
+        return self.act(x + self.c(x) * self.beta)
 
 
-model_pkg = _finish(types.ModuleType("model"), "model")
-sys.modules.setdefault("model", model_pkg)
-wp = _finish(types.ModuleType("model.warplayer"), "model.warplayer")
-wp.warp = _warp
-sys.modules.setdefault("model.warplayer", wp)
-setattr(model_pkg, "warplayer", wp)
-tl = _finish(types.ModuleType("train_log"), "train_log")
-tl.__path__ = sorted(set(os.path.dirname(p) for p in
-                         glob.glob(os.path.join("model_src", "**", "*.py"), recursive=True)))
-sys.modules.setdefault("train_log", tl)
+class Block(nn.Module):
+    def __init__(self, prefix, c0, c1, factor):
+        super().__init__()
+        self.factor = factor
+        self.c0 = conv(prefix + ".conv0.0.0.weight", stride=2)
+        self.c1 = conv(prefix + ".conv0.1.0.weight", stride=2)
+        self.cb = nn.ModuleList(
+            [ConvBlock(prefix + ".convblock.%d" % i) for i in range(8)])
+        self.last = deconv(prefix + ".lastconv.0.weight")
+        self.ps = nn.PixelShuffle(2)
+        self.relu = nn.ReLU()
+
+    def forward(self, x, flow):
+        if flow is not None:
+            x = torch.cat([x, flow], dim=1)
+        if self.factor > 1:
+            x = F.interpolate(x, scale_factor=1.0 / self.factor,
+                              mode="bilinear", align_corners=False)
+        y = self.relu(self.c0(x))
+        y = self.relu(self.c1(y))
+        for cb in self.cb:
+            y = cb(y)
+        y = self.ps(self.last(y))
+        if self.factor > 1:
+            y = F.interpolate(y, scale_factor=float(self.factor),
+                              mode="bilinear", align_corners=False)
+        return y[:, :4], y[:, 4:5], y[:, 5:13]
 
 
-def _load(path, name):
-    spec = importlib.util.spec_from_file_location(name, path)
-    m = importlib.util.module_from_spec(spec)
-    sys.modules[name] = m
-    spec.loader.exec_module(m)
-    return m
+class Net(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.e0 = conv("encode.cnn0.weight", stride=2)
+        self.e1 = conv("encode.cnn1.weight")
+        self.e2 = conv("encode.cnn2.weight")
+        self.ed = deconv("encode.cnn3.weight")
+        self.b0 = Block("block0", 96, 192, 16)
+        self.b1 = Block("block1", 64, 128, 8)
+        self.b2 = Block("block2", 48, 96, 4)
+        self.b3 = Block("block3", 32, 64, 2)
+        self.b4 = Block("block4", 16, 32, 1)
+
+    def encode(self, img):
+        return self.ed(self.e2(self.e1(self.e0(img))))
+
+    def forward(self, x):
+        img0 = x[:, 0:3]
+        img1 = x[:, 3:6]
+        ts = x[:, 6:7]
+        d0 = self.encode(img0)
+        d1 = self.encode(img1)
+        cat1 = torch.cat([img0, img1, d0, d1, ts], dim=1)
+        flow, mask, feat = self.b0(cat1, None)
+        for blk in (self.b1, self.b2, self.b3, self.b4):
+            w0 = warp(img0, flow[:, :2])
+            w1 = warp(img1, flow[:, 2:4])
+            wd0 = warp(d0, flow[:, :2])
+            wd1 = warp(d1, flow[:, 2:4])
+            x24 = torch.cat([w0, w1, wd0, wd1, ts, mask, feat], dim=1)
+            flow, mask, feat = blk(x24, flow)
+        w0 = warp(img0, flow[:, :2])
+        w1 = warp(img1, flow[:, 2:4])
+        return w0 * mask + w1 * (1.0 - mask)
 
 
-def _load_stubs(path, name, max_stub=10):
-    for _ in range(max_stub):
-        try:
-            return _load(path, name)
-        except ModuleNotFoundError as e:
-            miss = e.name
-            print("  auto-stub module:", miss)
-            mod = _finish(types.ModuleType(miss), miss)
-            mod.__getattr__ = lambda a: _noop
-            sys.modules[miss] = mod
-            parent = miss.rsplit(".", 1)[0]
-            if parent in sys.modules:
-                setattr(sys.modules[parent], miss.rsplit(".", 1)[1], mod)
-    raise RuntimeError("too many auto-stubs")
-
-
-def _missing_name(e):
-    n = getattr(e, "name", None)
-    if n:
-        return n
-    m = re.search(r"name '(\w+)' is not defined", str(e))
-    return m.group(1) if m else None
-
-
-def _call_with_injection(mod, fn, max_inject=16):
-    for _ in range(max_inject):
-        try:
-            return fn()
-        except NameError as e:
-            name = _missing_name(e)
-            if not name or name in mod.__dict__:
-                raise
-            mod.__dict__[name] = _DummyModule
-            print("  injected dummy global:", name)
-    return fn()
-
-
-py = None
-for p in glob.glob(os.path.join("model_src", "**", "RIFE_HDv3.py"), recursive=True):
-    py = p
-    break
-print("py:", py)
-mod = _load_stubs(py, "prov_rifehdv3")
-cls = getattr(mod, "Model")
-net = _call_with_injection(mod, lambda: cls())
-
-pkls = sorted(glob.glob(os.path.join("model_src", "**", "*.pkl"), recursive=True))
-sd = torch.load(pkls[0], map_location="cpu", weights_only=False)
-if isinstance(sd, dict) and "state_dict" in sd:
-    sd = sd["state_dict"]
-clean = {}
-for k, v in sd.items():
-    k2 = k
-    while k2.startswith("module."):
-        k2 = k2[len("module."):]
-    clean[k2] = v
-sd_if = {k: v for k, v in clean.items() if not k.startswith("refine.")}
-sd_rf = {k[len("refine."):]: v for k, v in clean.items() if k.startswith("refine.")}
-miss, unexp = net.flownet.load_state_dict(sd_if, strict=False)
-print("flownet load missing=%d unexpected=%d" % (len(miss), len(unexp)))
-if hasattr(net, "refine") and sd_rf:
-    m2, u2 = net.refine.load_state_dict(sd_rf, strict=False)
-    print("refine load missing=%d unexpected=%d" % (len(m2), len(u2)))
-net.eval()
-
-fl = net.flownet
-hooks = []
-
-
-def _shapes(x):
-    if isinstance(x, (tuple, list)):
-        return [tuple(t.shape) for t in x if torch.is_tensor(t)]
-    if torch.is_tensor(x):
-        return [tuple(x.shape)]
-    return []
-
-
-def mk(tag):
-    def hk(m, inp, out):
-        print("HOOK %-22s in=%s out=%s" % (tag, _shapes(inp), _shapes(out)))
-    return hk
-
-
-for i in range(5):
-    blk = getattr(fl, "block%d" % i, None)
-    if blk is None:
-        print("no block%d" % i)
-        continue
-    hooks.append(blk.register_forward_hook(mk("block%d" % i)))
-    hooks.append(blk.conv0[0][0].register_forward_hook(mk("block%d.conv0" % i)))
-    hooks.append(blk.lastconv[0].register_forward_hook(mk("block%d.lastconv" % i)))
-
-i0 = torch.rand(1, 3, 384, 512)
-i1 = torch.rand(1, 3, 384, 512)
+net = Net().eval()
+x = torch.rand(1, 7, 384, 512)
 with torch.no_grad():
-    try:
-        out = _call_with_injection(mod, lambda: net.inference(i0, i1, 0.5))
-    except TypeError:
-        out = _call_with_injection(mod, lambda: net.inference(i0, i1))
-print("inference out:", tuple(out.shape))
-for h in hooks:
-    h.remove()
-print("DIAG DONE")
+    y = net(x)
+print("eager out:", tuple(y.shape), "mean=%.4f min=%.4f max=%.4f"
+      % (float(y.mean()), float(y.min()), float(y.max())))
+assert tuple(y.shape) == (1, 3, 384, 512)
+torch.onnx.export(net, x, "rife_hand.onnx", opset_version=13,
+                  input_names=["in0"], output_names=["out0"],
+                  dynamo=False, do_constant_folding=True)
+print("wrote rife_hand.onnx (%d B)" % os.path.getsize("rife_hand.onnx"))
