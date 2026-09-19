@@ -33,12 +33,13 @@ jobs:
           find model_src -maxdepth 3 -type f | sort | head -80
 
       - name: export
-        run: python -u -X faulthandler rife_ncnn_writer.py python rife_warp_emit.py
+        run: python -u -X faulthandler rife_ncnn_writer.py
 
       - name: pnnx
         run: |
           set +e
-          for onnx in rife_hand.onnx rife_ifnet.onnx rife_rifehdv3.onnx; do
+          ls -la *.onnx 2>/dev/null
+          for onnx in rife_hand.onnx; do
             if [ -f "$onnx" ]; then
               echo "=== running pnnx on $onnx ==="
               pnnx "$onnx" inputshape=[1,7,384,512]
@@ -53,12 +54,7 @@ jobs:
         with:
           name: rife-models
           path: |
+            rife_hand.onnx
             rife_hand.ncnn.param
             rife_hand.ncnn.bin
-            rife_ifnet.ncnn.param
-            rife_ifnet.ncnn.bin
-            rife_rifehdv3.ncnn.param
-            rife_rifehdv3.ncnn.bin
-            rife_warp.ncnn.param
-            rife_warp.ncnn.bin
           if-no-files-found: ignore
