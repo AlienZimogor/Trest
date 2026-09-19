@@ -33,18 +33,17 @@ jobs:
           find model_src -maxdepth 3 -type f | sort | head -80
 
       - name: export
-        run: |
-          python -u -X faulthandler rife_ncnn_writer.py
-          xxd rife_hand.ncnn.param | head -4
+        run: python -u -X faulthandler rife_ncnn_writer.py
 
       - name: pnnx
         run: |
           set +e
-          ls -la *.onnx 2>/dev/null
-          for onnx in rife_ifnet.onnx rife_rifehdv3.onnx; do
+          for onnx in rife_hand.onnx rife_ifnet.onnx rife_rifehdv3.onnx; do
             if [ -f "$onnx" ]; then
               echo "=== running pnnx on $onnx ==="
               pnnx "$onnx" inputshape=[1,7,384,512]
+              echo "=== PARAM HEAD of ${onnx%.onnx}.ncnn.param ==="
+              head -12 "${onnx%.onnx}.ncnn.param" 2>/dev/null
               echo "=== LAYER TYPES ==="
               awk 'NR>2 {print $1}' "${onnx%.onnx}.ncnn.param" 2>/dev/null | sort | uniq -c | sort -rn
             fi
