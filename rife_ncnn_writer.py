@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""v14: диагностика рекурренсии RIFE v4.26 — печатает фактические формы
-входов/выходов block0..block4 при одном прогоне Model.inference.
-Даёт каналы cat, пространственные размеры (Interp-факторы) и выходы lastconv."""
+"""v15: диагностика рекурренсии — tuple-безопасные хуки на block0..block4
+(вход-cat и выходы flow/mask/feat) + conv0/lastconv каждого блока."""
 import os, sys, glob, types, re, importlib.util, importlib.machinery
 import torch
 
@@ -131,10 +130,17 @@ fl = net.flownet
 hooks = []
 
 
+def _shapes(x):
+    if isinstance(x, (tuple, list)):
+        return [tuple(t.shape) for t in x if torch.is_tensor(t)]
+    if torch.is_tensor(x):
+        return [tuple(x.shape)]
+    return []
+
+
 def mk(tag):
     def hk(m, inp, out):
-        shapes = [tuple(t.shape) for t in inp if torch.is_tensor(t)]
-        print("HOOK %-24s in=%s out=%s" % (tag, shapes, tuple(out.shape)))
+        print("HOOK %-22s in=%s out=%s" % (tag, _shapes(inp), _shapes(out)))
     return hk
 
 
@@ -144,8 +150,7 @@ for i in range(5):
         print("no block%d" % i)
         continue
     hooks.append(blk.register_forward_hook(mk("block%d" % i)))
-    c0 = blk.conv0[0][0]
-    hooks.append(c0.register_forward_hook(mk("block%d.conv0" % i)))
+    hooks.append(blk.conv0[0][0].register_forward_hook(mk("block%d.conv0" % i)))
     hooks.append(blk.lastconv[0].register_forward_hook(mk("block%d.lastconv" % i)))
 
 i0 = torch.rand(1, 3, 384, 512)
