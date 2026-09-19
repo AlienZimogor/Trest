@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""RIFE v4.26 -> ONNX(opset16, native GridSample) -> pnnx -> ncnn.
-v19: remap ключей pkl (encode.*/block*.*) во внутренние имена + чистый F.grid_sample."""
+"""RIFE v4.26 -> ONNX(opset16, native GridSample) -> pnnx -> ncnn param/bin.
+Веса берутся из pkl релиза; архитектура собирается вручную (encode x2 + b0..b4)."""
 import os, glob
 import torch
 import torch.nn as nn
@@ -25,42 +25,12 @@ print("pkl:", pkls[:3])
 raw = torch.load(pkls[0], map_location="cpu", weights_only=False)
 if isinstance(raw, dict) and "state_dict" in raw:
     raw = raw["state_dict"]
-clean = {}
+sd = {}
 for k, v in raw.items():
     k2 = k
     while k2.startswith("module."):
         k2 = k2[len("module."):]
-    clean[k2] = v
-
-REN = {
-    "e0": "encode.cnn0", "e1": "encode.cnn1",
-    "e2": "encode.cnn2", "ed": "encode.cnn3",
-}
-for i in range(5):
-    REN["b%d.c0" % i] = "block%d.conv0.0.0" % i
-    REN["b%d.c1" % i] = "block%d.conv0.1.0" % i
-    for n in range(8):
-        REN["b%d.cb.%d.c" % (i, n)] = "block%d.convblock.%d.conv" % (i, n)
-        REN["b%d.cb.%d.beta" % (i, n)] = "block%d.convblock.%d.beta" % (i, n)
-    REN["b%d.last" % i] = "block%d.lastconv.0" % i
-
-sd = {}
-missing = []
-for internal, src in REN.items():
-    if internal.endswith(".beta"):
-        if src in clean:
-            sd[internal] = clean[src]
-        else:
-            missing.append(src)
-    else:
-        if (src + ".weight") in clean:
-            sd[internal + ".weight"] = clean[src + ".weight"]
-        else:
-            missing.append(src + ".weight")
-        if (src + ".bias") in clean:
-            sd[internal + ".bias"] = clean[src + ".bias"]
-print("remapped tensors:", len(sd), "missing:", missing[:8])
-assert not missing, missing
+    sd[k2] = v
 
 
 def conv(key, stride=1):
@@ -88,12 +58,12 @@ def warp(x, flow):
     ys = torch.arange(H, device=x.device, dtype=x.dtype)
     xs = torch.arange(W, device=x.device, dtype=x.dtype)
     gy, gx = torch.meshgrid(ys, xs, indexing="ij")
-    base = torch.stack([gx, gy], dim=-1).unsqueeze(0)          # (1,H,W,2)
-    f = flow.permute(0, 2, 3, 1).float()                        # (N,H,W,2)
+    base = torch.stack([gx, gy], dim=-1).unsqueeze(0)
+    f = flow.permute(0, 2, 3, 1).float()
     vgrid = base + f
     vgrid = torch.stack([
         2.0 * vgrid[..., 0] / max(W - 1, 1) - 1.0,
-        2.0 * vgrid[..., 1] / max(H - 1, 1) - 1.0], dim=-1)    # (N,H,W,2)
+        2.0 * vgrid[..., 1] / max(H - 1, 1) - 1.0], dim=-1)
     return F.grid_sample(x, vgrid, align_corners=True,
                          mode="bilinear", padding_mode="zeros")
 
