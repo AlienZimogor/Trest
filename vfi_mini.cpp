@@ -82,10 +82,8 @@ public:
         support_packing = false;
     }
     virtual int load_param(const ncnn::ParamDict& pd) {
-        w = pd.get(0, -1);
-        h = pd.get(1, -1);
-        c11 = pd.get(11, 0);
-        c2 = pd.get(2, 0);
+        w = pd.get(0, -1); h = pd.get(1, -1);
+        c11 = pd.get(11, 0); c2 = pd.get(2, 0);
         return 0;
     }
     virtual int forward(const std::vector<ncnn::Mat>& bb,
@@ -234,10 +232,7 @@ public:
                         sy = ((g1 + 1.f) * IH - 1.f) * 0.5f;
                     }
                     if (sx < 0.f || sx > (float)(IW - 1) ||
-                        sy < 0.f || sy > (float)(IH - 1)) {
-                        tp[y * GW + xi] = 0.f;
-                        continue;
-                    }
+                        sy < 0.f || sy > (float)(IH - 1)) { tp[y * GW + xi] = 0.f; continue; }
                     const int x0 = (int)sx, y0 = (int)sy;
                     const int x1 = std::min(x0 + 1, IW - 1);
                     const int y1 = std::min(y0 + 1, IH - 1);
