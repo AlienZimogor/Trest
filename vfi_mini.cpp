@@ -7,6 +7,7 @@
 #include <time.h>
 #include <math.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <thread>
@@ -38,6 +39,20 @@ static void start_heartbeat() {
             fflush(stderr);
         }
     }).detach();
+}
+
+static void dump_param_head(const char* path) {
+    FILE* fp = fopen(path, "rb");
+    if (!fp) { fprintf(stderr, "DUMP: cannot open %s\n", path); fflush(stderr); return; }
+    unsigned char buf[32];
+    size_t n = fread(buf, 1, sizeof(buf), fp);
+    fclose(fp);
+    fprintf(stderr, "DUMP param head (%zu bytes):", n);
+    for (size_t i = 0; i < n; i++) fprintf(stderr, " %02x", buf[i]);
+    fprintf(stderr, "\nDUMP ascii: |");
+    for (size_t i = 0; i < n; i++) fputc(isprint(buf[i]) ? buf[i] : '.', stderr);
+    fprintf(stderr, "|\n");
+    fflush(stderr);
 }
 
 static void parse_opt(const char* e, int& threads, bool& fp16) {
@@ -166,8 +181,82 @@ public:
     }
 };
 
+class GridSample_fix : public ncnn::Layer {
+public:
+    int align_corners;
+    mutable bool logged = false;
+    GridSample_fix() {
+        align_corners = 1;
+        support_vulkan = false;
+        support_fp16_storage = false;
+        support_packing = false;
+    }
+    virtual int load_param(const ncnn::ParamDict& pd) {
+        align_corners = pd.get(2, 1);
+        return 0;
+    }
+    virtual int forward(const std::vector<ncnn::Mat>& bb,
+                        std::vector<ncnn::Mat>& tb,
+                        const ncnn::Option& opt) const {
+        const ncnn::Mat& x = bb[0];
+        const ncnn::Mat& grid = bb[1];
+        const int IW = x.w, IH = x.h, C = x.c;
+        const int GW = grid.w, GH = grid.h;
+        if (!logged) {
+            fprintf(stderr, "GRIDSAMPLE %s x=%dx%dx%d grid=%dx%dx%d\n",
+                    name.c_str(), IW, IH, C, GW, GH, grid.c);
+            fflush(stderr);
+            logged = true;
+        }
+        if (x.empty() || grid.empty() || grid.elemsize != 4u || grid.elempack != 1 ||
+            (int)grid.total() < GW * GH * 2) {
+            fprintf(stderr, "GRIDSAMPLE_GUARD %s x=%dx%dx%d grid=%dx%dx%d total=%d\n",
+                    name.c_str(), IW, IH, C, GW, GH, grid.c, (int)grid.total());
+            return -100;
+        }
+        ncnn::Mat& top = tb[0];
+        top.create(GW, GH, C, 4u, opt.blob_allocator);
+        if (top.empty()) return -100;
+        const float* gp = (const float*)grid.data;
+        for (int c = 0; c < C; c++) {
+            const float* xp = x.channel(c);
+            float* tp = top.channel(c);
+            for (int y = 0; y < GH; y++) {
+                for (int xi = 0; xi < GW; xi++) {
+                    const float g0 = gp[(y * GW + xi) * 2];
+                    const float g1 = gp[(y * GW + xi) * 2 + 1];
+                    float sx, sy;
+                    if (align_corners) {
+                        sx = (g0 + 1.f) * (IW - 1) * 0.5f;
+                        sy = (g1 + 1.f) * (IH - 1) * 0.5f;
+                    } else {
+                        sx = ((g0 + 1.f) * IW - 1.f) * 0.5f;
+                        sy = ((g1 + 1.f) * IH - 1.f) * 0.5f;
+                    }
+                    if (sx < 0.f || sx > (float)(IW - 1) ||
+                        sy < 0.f || sy > (float)(IH - 1)) {
+                        tp[y * GW + xi] = 0.f;
+                        continue;
+                    }
+                    const int x0 = (int)sx, y0 = (int)sy;
+                    const int x1 = std::min(x0 + 1, IW - 1);
+                    const int y1 = std::min(y0 + 1, IH - 1);
+                    const float ax = sx - (float)x0, ay = sy - (float)y0;
+                    tp[y * GW + xi] =
+                        (1 - ax) * (1 - ay) * xp[y0 * IW + x0] +
+                        ax * (1 - ay) * xp[y0 * IW + x1] +
+                        (1 - ax) * ay * xp[y1 * IW + x0] +
+                        ax * ay * xp[y1 * IW + x1];
+                }
+            }
+        }
+        return 0;
+    }
+};
+
 static ncnn::Layer* Reshape_fix_creator(void*) { return new Reshape_fix; }
 static ncnn::Layer* Slice_fix_creator(void*) { return new Slice_fix; }
+static ncnn::Layer* GridSample_fix_creator(void*) { return new GridSample_fix; }
 
 static const char* warp_glsl = R"GLSL(
 #version 450
@@ -289,6 +378,7 @@ static ncnn::Layer* Warp_layer_creator(void*) { return new Warp_layer; }
 static void register_all(ncnn::Net& net) {
     net.register_custom_layer(ncnn::layer_to_index("Reshape"), Reshape_fix_creator);
     net.register_custom_layer(ncnn::layer_to_index("Slice"), Slice_fix_creator);
+    net.register_custom_layer(ncnn::layer_to_index("GridSample"), GridSample_fix_creator);
     net.register_custom_layer("rife.Warp", Warp_layer_creator);
 }
 
@@ -311,7 +401,11 @@ static int run_net(bool warp_gpu, bool use_vulkan,
     register_all(net);
     g_phase = "load";
     fprintf(stderr, "LOAD: param %s\n", param); fflush(stderr);
-    if (net.load_param(param) != 0) { fprintf(stderr, "ERR: load_param failed\n"); fflush(NULL); return 2; }
+    if (net.load_param(param) != 0) {
+        fprintf(stderr, "ERR: load_param failed\n");
+        dump_param_head(param);
+        fflush(NULL); return 2;
+    }
     fprintf(stderr, "LOAD: param ok layers=%d\n", (int)net.layers().size()); fflush(stderr);
     fprintf(stderr, "LOAD: model %s\n", bin); fflush(stderr);
     if (net.load_model(bin) != 0) { fprintf(stderr, "ERR: load_model failed\n"); fflush(NULL); return 2; }
@@ -413,7 +507,11 @@ static int bisect(const char* param, const char* bin, int W, int H) {
     register_all(net);
     g_phase = "load";
     fprintf(stderr, "LOAD: param %s\n", param); fflush(stderr);
-    if (net.load_param(param) != 0) { fprintf(stderr, "ERR: load_param failed in bisect\n"); fflush(NULL); return 2; }
+    if (net.load_param(param) != 0) {
+        fprintf(stderr, "ERR: load_param failed in bisect\n");
+        dump_param_head(param);
+        fflush(NULL); return 2;
+    }
     fprintf(stderr, "LOAD: param ok layers=%d\n", (int)net.layers().size()); fflush(stderr);
     fprintf(stderr, "LOAD: model %s\n", bin); fflush(stderr);
     if (net.load_model(bin) != 0) { fprintf(stderr, "ERR: load_model failed in bisect\n"); fflush(NULL); return 2; }
