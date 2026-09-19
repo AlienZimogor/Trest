@@ -22,9 +22,6 @@ MIN_WEIGHT_ELEMS = 2_000_000
 DUMMY = torch.rand(1, 7, 384, 512)
 SCALE = [32.0, 16.0, 8.0, 4.0, 2.0]
 
-_ELEM_BYTES = {1: 4, 2: 1, 3: 1, 4: 1, 5: 2, 6: 4, 7: 8, 9: 8,
-               10: 2, 11: 2, 12: 4, 13: 8, 14: 4, 15: 4, 16: 8, 17: 4}
-
 
 def onnx_inspect(path):
     m = onnx.load(path, load_external_data=False)
@@ -222,88 +219,84 @@ def find_py(base):
     return None
 
 
-def _pick(out):
-    if isinstance(out, dict):
-        for k in ("merged", "img_pred", "pred", "output"):
-            if k in out and torch.is_tensor(out[k]):
-                return _pick(out[k])
-        out = [v for v in out.values() if torch.is_tensor(v)]
-    if isinstance(out, (tuple, list)):
-        shapes = [tuple(t.shape) for t in out if torch.is_tensor(t)]
-        print("  output tuple shapes:", shapes)
-        c3 = [t for t in out if torch.is_tensor(t) and t.dim() == 4 and t.shape[1] == 3]
-        if c3:
-            return c3[-1]
-        raise RuntimeError("no 3-channel frame in output tuple: %s" % (shapes,))
-    if torch.is_tensor(out) and out.dim() == 4 and out.shape[1] == 3:
-        return out
-    raise RuntimeError("output is not a 3-channel frame: %s" %
-                       (tuple(out.shape) if torch.is_tensor(out) else type(out),))
+def probe_call(net, is_model):
+    """Eager-проба форм вызова (лямбды только здесь, вне трейса)."""
+    i0 = DUMMY[:, 0:3]
+    i1 = DUMMY[:, 3:6]
+    ts = DUMMY[:, 6:7].mean(dim=(2, 3), keepdim=True)
+    if is_model:
+        forms = [
+            lambda: net.inference(i0, i1, 0.5),
+            lambda: net.inference(i0, i1, ts),
+            lambda: net.inference(i0, i1),
+            lambda: net(i0, i1, 0.5),
+        ]
+    else:
+        forms = [
+            lambda: net(DUMMY, ts, SCALE, False, True, False),
+            lambda: net(DUMMY, ts, SCALE, False, False, False),
+            lambda: net(DUMMY, ts, SCALE),
+            lambda: net(DUMMY, ts),
+        ]
+    for k, fn in enumerate(forms):
+        try:
+            with torch.no_grad():
+                out = fn()
+        except Exception as e:
+            print("  probe form %d fail: %s: %s" % (k, type(e).__name__, e))
+            continue
+        if torch.is_tensor(out):
+            if out.dim() == 4 and out.shape[1] == 3:
+                return k, -1
+            continue
+        if isinstance(out, (tuple, list)):
+            for j, t in enumerate(out):
+                if j < 4 and torch.is_tensor(t) and t.dim() == 4 and t.shape[1] == 3:
+                    return k, j
+    return None
 
 
-def make_wrapper_model(net, mod):
-    class W(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.net = net
+class W(nn.Module):
+    """TorchScript-трейсибельная обёртка: без лямбд, прямые вызовы в if-цепочке."""
+    def __init__(self, net, kind, out_idx):
+        super().__init__()
+        self.net = net
+        self.kind = kind
+        self.out_idx = out_idx
 
-        def forward(self, x):
-            i0 = x[:, 0:3]
-            i1 = x[:, 3:6]
-            errs = []
-            for idx, fn in enumerate((
-                lambda: self.net.inference(i0, i1, 0.5),
-                lambda: self.net.inference(i0, i1, timestep=0.5),
-                lambda: self.net.inference(i0, i1),
-                lambda: self.net(i0, i1, 0.5),
-            )):
-                try:
-                    return _pick(fn())
-                except NameError:
-                    raise
-                except Exception as e:
-                    errs.append("#%d %s: %s" % (idx, type(e).__name__, e))
-            print("  Model inference attempts failed:")
-            for e in errs:
-                print("   ", e)
-            raise RuntimeError("Model inference failed")
-    return W()
+    def _sel(self, out):
+        if self.out_idx < 0:
+            return out
+        if self.out_idx == 0:
+            return out[0]
+        elif self.out_idx == 1:
+            return out[1]
+        elif self.out_idx == 2:
+            return out[2]
+        else:
+            return out[3]
 
-
-def make_wrapper_ifnet(net):
-    fparams = list(inspect.signature(net.forward).parameters.keys())
-    print("  forward params:", fparams)
-
-    class W(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.net = net
-
-        def forward(self, x):
-            ts = x[:, 6:7].mean(dim=(2, 3), keepdim=True)
-            i0 = x[:, 0:3]; i1 = x[:, 3:6]
-            attempts = [
-                lambda: self.net(x, ts, SCALE, False, True, False),
-                lambda: self.net(x, ts, SCALE, False, False, False),
-                lambda: self.net(x, ts, SCALE, False, True),
-                lambda: self.net(x, ts, SCALE, False, False),
-                lambda: self.net(x, ts, SCALE),
-                lambda: self.net(x, ts),
-                lambda: self.net(x),
-            ]
-            errs = []
-            for idx, fn in enumerate(attempts):
-                try:
-                    return _pick(fn())
-                except NameError:
-                    raise
-                except Exception as e:
-                    errs.append("#%d %s: %s" % (idx, type(e).__name__, e))
-            print("  IFNet forward attempts failed:")
-            for e in errs:
-                print("   ", e)
-            raise RuntimeError("IFNet forward failed")
-    return W()
+    def forward(self, x):
+        i0 = x[:, 0:3]
+        i1 = x[:, 3:6]
+        ts = x[:, 6:7].mean(dim=(2, 3), keepdim=True)
+        if self.kind == 0:
+            out = self.net.inference(i0, i1, 0.5)
+        elif self.kind == 1:
+            out = self.net.inference(i0, i1, ts)
+        elif self.kind == 2:
+            out = self.net.inference(i0, i1)
+        elif self.kind == 3:
+            out = self.net(i0, i1, 0.5)
+        elif self.kind == 4:
+            out = self.net(x, ts, SCALE, False, True, False)
+        elif self.kind == 5:
+            out = self.net(x, ts, SCALE, False, False, False)
+        elif self.kind == 6:
+            out = self.net(x, ts, SCALE)
+        else:
+            out = self.net(x, ts)
+        return self._sel(out)
 
 
 def build_set(set_name):
@@ -351,9 +344,15 @@ def build_set(set_name):
         print("SKIP: missing=%d > 0" % len(miss))
         return None
     net.eval()
-    w = make_wrapper_model(net, mod) if set_name == "rifehdv3" else make_wrapper_ifnet(net)
-    w.eval()
-    return w
+    is_model = (set_name == "rifehdv3")
+    pr = probe_call(net, is_model)
+    if pr is None:
+        print("SKIP: no working call form")
+        return None
+    kind, out_idx = pr
+    kind = kind + (0 if is_model else 4)
+    print("  probe ok: kind=%d out_idx=%d" % (kind, out_idx))
+    return W(net, kind, out_idx)
 
 
 def do_export(set_name, kind):
@@ -382,7 +381,7 @@ for set_name, py_base, class_names in TARGETS:
         continue
     try:
         with torch.no_grad():
-            ref = _pick(w(DUMMY))
+            ref = w(DUMMY)
     except Exception as e:
         print("SKIP: forward fail ->", e)
         continue
