@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""v13: диагностика рекурренсии RIFE v4.26 — печатает фактические формы
+"""v14: диагностика рекурренсии RIFE v4.26 — печатает фактические формы
 входов/выходов block0..block4 при одном прогоне Model.inference.
 Даёт каналы cat, пространственные размеры (Interp-факторы) и выходы lastconv."""
-import os, glob, types, importlib.util, importlib.machinery
+import os, sys, glob, types, re, importlib.util, importlib.machinery
 import torch
 
 
@@ -43,23 +43,21 @@ def _finish(mod, name):
 
 
 model_pkg = _finish(types.ModuleType("model"), "model")
-sys_modules = __import__("sys").modules
-sys_modules.setdefault("model", model_pkg)
+sys.modules.setdefault("model", model_pkg)
 wp = _finish(types.ModuleType("model.warplayer"), "model.warplayer")
-wp.__path__ = []
 wp.warp = _warp
-sys_modules.setdefault("model.warplayer", wp)
+sys.modules.setdefault("model.warplayer", wp)
 setattr(model_pkg, "warplayer", wp)
 tl = _finish(types.ModuleType("train_log"), "train_log")
 tl.__path__ = sorted(set(os.path.dirname(p) for p in
                          glob.glob(os.path.join("model_src", "**", "*.py"), recursive=True)))
-sys_modules.setdefault("train_log", tl)
+sys.modules.setdefault("train_log", tl)
 
 
 def _load(path, name):
     spec = importlib.util.spec_from_file_location(name, path)
     m = importlib.util.module_from_spec(spec)
-    sys_modules[name] = m
+    sys.modules[name] = m
     spec.loader.exec_module(m)
     return m
 
@@ -67,27 +65,48 @@ def _load(path, name):
 def _load_stubs(path, name, max_stub=10):
     for _ in range(max_stub):
         try:
-            m = _load(path, name)
-            m.__getattr__ = lambda a: _DummyModule
-            return m
+            return _load(path, name)
         except ModuleNotFoundError as e:
             miss = e.name
+            print("  auto-stub module:", miss)
             mod = _finish(types.ModuleType(miss), miss)
             mod.__getattr__ = lambda a: _noop
-            sys_modules[miss] = mod
+            sys.modules[miss] = mod
             parent = miss.rsplit(".", 1)[0]
-            if parent in sys_modules:
-                setattr(sys_modules[parent], miss.rsplit(".", 1)[1], mod)
-    raise RuntimeError("stubs")
+            if parent in sys.modules:
+                setattr(sys.modules[parent], miss.rsplit(".", 1)[1], mod)
+    raise RuntimeError("too many auto-stubs")
+
+
+def _missing_name(e):
+    n = getattr(e, "name", None)
+    if n:
+        return n
+    m = re.search(r"name '(\w+)' is not defined", str(e))
+    return m.group(1) if m else None
+
+
+def _call_with_injection(mod, fn, max_inject=16):
+    for _ in range(max_inject):
+        try:
+            return fn()
+        except NameError as e:
+            name = _missing_name(e)
+            if not name or name in mod.__dict__:
+                raise
+            mod.__dict__[name] = _DummyModule
+            print("  injected dummy global:", name)
+    return fn()
 
 
 py = None
 for p in glob.glob(os.path.join("model_src", "**", "RIFE_HDv3.py"), recursive=True):
     py = p
     break
+print("py:", py)
 mod = _load_stubs(py, "prov_rifehdv3")
 cls = getattr(mod, "Model")
-net = cls()
+net = _call_with_injection(mod, lambda: cls())
 
 pkls = sorted(glob.glob(os.path.join("model_src", "**", "*.pkl"), recursive=True))
 sd = torch.load(pkls[0], map_location="cpu", weights_only=False)
@@ -101,9 +120,11 @@ for k, v in sd.items():
     clean[k2] = v
 sd_if = {k: v for k, v in clean.items() if not k.startswith("refine.")}
 sd_rf = {k[len("refine."):]: v for k, v in clean.items() if k.startswith("refine.")}
-net.flownet.load_state_dict(sd_if, strict=False)
+miss, unexp = net.flownet.load_state_dict(sd_if, strict=False)
+print("flownet load missing=%d unexpected=%d" % (len(miss), len(unexp)))
 if hasattr(net, "refine") and sd_rf:
-    net.refine.load_state_dict(sd_rf, strict=False)
+    m2, u2 = net.refine.load_state_dict(sd_rf, strict=False)
+    print("refine load missing=%d unexpected=%d" % (len(m2), len(u2)))
 net.eval()
 
 fl = net.flownet
@@ -113,16 +134,17 @@ hooks = []
 def mk(tag):
     def hk(m, inp, out):
         shapes = [tuple(t.shape) for t in inp if torch.is_tensor(t)]
-        print("HOOK %-28s in=%s out=%s" % (tag, shapes, tuple(out.shape)))
+        print("HOOK %-24s in=%s out=%s" % (tag, shapes, tuple(out.shape)))
     return hk
 
 
 for i in range(5):
     blk = getattr(fl, "block%d" % i, None)
     if blk is None:
+        print("no block%d" % i)
         continue
     hooks.append(blk.register_forward_hook(mk("block%d" % i)))
-    c0 = blk.conv0[0][0] if hasattr(blk.conv0[0], "__getitem__") else blk.conv0[0]
+    c0 = blk.conv0[0][0]
     hooks.append(c0.register_forward_hook(mk("block%d.conv0" % i)))
     hooks.append(blk.lastconv[0].register_forward_hook(mk("block%d.lastconv" % i)))
 
@@ -130,9 +152,9 @@ i0 = torch.rand(1, 3, 384, 512)
 i1 = torch.rand(1, 3, 384, 512)
 with torch.no_grad():
     try:
-        out = net.inference(i0, i1, 0.5)
+        out = _call_with_injection(mod, lambda: net.inference(i0, i1, 0.5))
     except TypeError:
-        out = net.inference(i0, i1)
+        out = _call_with_injection(mod, lambda: net.inference(i0, i1))
 print("inference out:", tuple(out.shape))
 for h in hooks:
     h.remove()
