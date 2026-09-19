@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Инкремент 1: минимальный рукописный ncnn (Crop->Conv) для проверки
-формата bin и загрузки весов block0.conv0. Ожидаем бисект: Crop c=3, Conv c=16."""
+формата bin и загрузки весов. Вес первой 3->16 свёртки ищется по форме,
+имя ключа печатается. Ожидание бисекта: Crop c=3, Conv c=16, ALL LAYERS OK."""
 import struct, os, glob
 import torch
 
@@ -30,10 +31,18 @@ for k, v in sd_raw.items():
         k2 = k2[len("module."):]
     sd[k2] = v
 
-W = sd["block0.conv0.0.0.weight"]   # [16,3,3,3]
-B = sd["block0.conv0.0.0.bias"]     # [16]
-print("W", tuple(W.shape), "B", tuple(B.shape))
-assert tuple(W.shape) == (16, 3, 3, 3), W.shape
+W = B = None
+wkey = None
+for k, v in sd.items():
+    if v.dim() == 4 and tuple(v.shape) == (16, 3, 3, 3):
+        W = v
+        wkey = k
+        B = sd.get(k.replace(".weight", ".bias"))
+        break
+print("found conv weight key:", wkey, "W", tuple(W.shape), "B",
+      tuple(B.shape) if B is not None else None)
+assert W is not None, "no (16,3,3,3) conv weight found"
+assert B is not None and tuple(B.shape) == (16,), "bias mismatch"
 
 
 def wblob(f, t):
