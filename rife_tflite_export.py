@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """RIFE v4.26 -> LiteRT (.tflite), NHWC [1,384,512,7] -> [1,384,512,3].
-Warp собран из TFLite-builtin ops (gather_nd), без grid_sample/Flex.
-CI-гейт: сравнение с PyTorch-эталоном (max|diff| < 1e-3) до конвертации.
-Ключи pkl: encode.cnn0..3, block{i}.conv0.0.0/.conv0.1.0,
-block{i}.convblock.{n}.conv/.beta, block{i}.lastconv.0"""
+Warp = TFLite-builtin gather_nd (без grid_sample/Flex).
+ГЕЙТ: постадийный max|diff| torch vs tf (d0/d1, block0 flow/mask/feat, финал);
+конвертация только если финальный diff < 1e-3."""
 import os, glob
 import numpy as np
 import torch
@@ -43,7 +42,7 @@ def npb(k):
     return None if b is None else b.detach().cpu().numpy().astype(np.float32)
 
 
-# ---------------- PyTorch-эталон (для гейта точности) ----------------
+# ---------------- PyTorch-эталон ----------------
 def tconv(key, stride=1):
     w = sd[key + ".weight"]; b = sd.get(key + ".bias")
     c = nn.Conv2d(w.shape[1], w.shape[0], w.shape[2], stride, w.shape[2] // 2,
@@ -69,14 +68,13 @@ def twarp(x, flow):
     gy, gx = torch.meshgrid(ys, xs, indexing="ij")
     base = torch.stack([gx, gy], -1).unsqueeze(0)
     vg = base + flow.permute(0, 2, 3, 1)
-    # grid_sample(align_corners=True) ждёт НОРМИРОВАННЫЙ grid [-1,1]
     vg = torch.stack([2.0 * vg[..., 0] / (WW - 1) - 1.0,
                       2.0 * vg[..., 1] / (HH - 1) - 1.0], -1)
     return F.grid_sample(x, vg, align_corners=True, padding_mode="zeros")
 
 
 class TConvBlock(nn.Module):
-    def __init__(s, pre):          # pre = block{i}.convblock.{n}
+    def __init__(s, pre):
         super().__init__()
         s.c = tconv(pre + ".conv")
         s.register_buffer("beta", sd[pre + ".beta"])
@@ -104,19 +102,18 @@ class TBlock(nn.Module):
         for cb in s.cb: y = cb(y)
         y = s.ps(s.last(y))
         if s.f > 1:
-            x2 = F.interpolate(y, scale_factor=float(s.f), mode="bilinear", align_corners=False)
-            y = x2
+            y = F.interpolate(y, scale_factor=float(s.f), mode="bilinear", align_corners=False)
         return y[:, :4], torch.sigmoid(y[:, 4:5]), y[:, 5:13]
 
 
 class TNet(nn.Module):
     def __init__(s):
         super().__init__()
-        s.e0 = tconv("encode.cnn0", 2)
-        s.e1 = tconv("encode.cnn1")
-        s.e2 = tconv("encode.cnn2")
-        s.ed = tdeconv("encode.cnn3")
+        s.e0 = tconv("encode.cnn0", 2); s.e1 = tconv("encode.cnn1")
+        s.e2 = tconv("encode.cnn2"); s.ed = tdeconv("encode.cnn3")
         s.b = nn.ModuleList([TBlock(i, FACT[i]) for i in range(5)])
+        s.debug = False
+        s.dbg = {}
 
     def enc(s, img):
         return s.ed(s.e2(s.e1(s.e0(img))))
@@ -124,17 +121,21 @@ class TNet(nn.Module):
     def forward(s, x):
         img0 = x[:, :3]; img1 = x[:, 3:6]; ts = x[:, 6:7]
         d0 = s.enc(img0); d1 = s.enc(img1)
+        if s.debug: s.dbg["d0"] = d0; s.dbg["d1"] = d1
         flow, mask, feat = s.b[0](torch.cat([img0, img1, d0, d1, ts], 1))
+        if s.debug:
+            s.dbg["f0"] = flow; s.dbg["m0"] = mask; s.dbg["fe0"] = feat
         for i in range(1, 5):
             fa = flow[:, :2]; fb = flow[:, 2:4]
             cat = torch.cat([twarp(img0, fa), twarp(img1, fb), twarp(d0, fa), twarp(d1, fb),
                              ts, mask, feat, flow], 1)
             flow, mask, feat = s.b[i](cat)
         fa = flow[:, :2]; fb = flow[:, 2:4]
-        return twarp(img0, fa) * mask + twarp(img1, fb) * (1 - mask)
+        out = twarp(img0, fa) * mask + twarp(img1, fb) * (1 - mask)
+        return out
 
 
-# ---------------- TF-граф (TFLite-builtin) ----------------
+# ---------------- TF-зеркало ----------------
 CK = {}; BK = {}; DK = {}; BV = {}
 CONV_KEYS = ["encode.cnn0", "encode.cnn1", "encode.cnn2"] + \
             ["block%d.conv0.0.0" % i for i in range(5)] + \
@@ -179,10 +180,8 @@ def fwarp(x, flow):
     cy0 = tf.clip_by_value(tf.cast(y0, tf.int32), 0, Hh - 1)
     cx1 = tf.clip_by_value(cx0 + 1, 0, Ww - 1)
     cy1 = tf.clip_by_value(cy0 + 1, 0, Hh - 1)
-    v00 = tf.gather_nd(xx, tf.stack([cy0, cx0], -1))
-    v01 = tf.gather_nd(xx, tf.stack([cy0, cx1], -1))
-    v10 = tf.gather_nd(xx, tf.stack([cy1, cx0], -1))
-    v11 = tf.gather_nd(xx, tf.stack([cy1, cx1], -1))
+    idx = lambda cy, cx: tf.gather_nd(xx, tf.stack([cy, cx], -1))
+    v00 = idx(cy0, cx0); v01 = idx(cy0, cx1); v10 = idx(cy1, cx0); v11 = idx(cy1, cx1)
     ax = (gx - x0)[:, :, None]; ay = (gy - y0)[:, :, None]
     out = (v00 * (1 - ax) + v01 * ax) * (1 - ay) + (v10 * (1 - ax) + v11 * ax) * ay
     out = out * tf.cast(valid[:, :, None], tf.float32)
@@ -192,8 +191,6 @@ def fwarp(x, flow):
 def fblock(x, i):
     f = FACT[i]
     if f > 1:
-        # TF2 tf.image.resize НЕ принимает align_corners; дефолт bilinear
-        # (half-pixel centers) == PyTorch align_corners=False, что и нужно RIFE.
         x = tf.image.resize(x, [H // f, W // f], method="bilinear")
     y = tf.nn.relu(conv2d(x, "block%d.conv0.0.0" % i, 2))
     y = tf.nn.relu(conv2d(y, "block%d.conv0.1.0" % i, 2))
@@ -221,13 +218,32 @@ def fnet(x):
     return fwarp(img0, fa) * mask + fwarp(img1, fb) * (1 - mask)
 
 
-# ---------------- гейт точности + конвертация ----------------
+@tf.function(input_signature=[tf.TensorSpec([1, H, W, 7], tf.float32)])
+def fnet_stage0(x):
+    img0 = x[:, :, :, :3]; img1 = x[:, :, :, 3:6]; ts = x[:, :, :, 6:7]
+    d0 = deconv2d(conv2d(conv2d(conv2d(img0, "encode.cnn0", 2), "encode.cnn1", 1), "encode.cnn2", 1), "encode.cnn3")
+    d1 = deconv2d(conv2d(conv2d(conv2d(img1, "encode.cnn0", 2), "encode.cnn1", 1), "encode.cnn2", 1), "encode.cnn3")
+    flow, mask, feat = fblock(tf.concat([img0, img1, d0, d1, ts], -1), 0)
+    return d0, d1, flow, mask, feat
+
+
+# ---------------- гейт ----------------
+def md(a, b): return float(np.max(np.abs(a - b)))
+
+
 xr = np.random.RandomState(0).rand(1, H, W, 7).astype(np.float32)
-tnet = TNet().eval()
+xt = torch.tensor(xr).permute(0, 3, 1, 2)
+tnet = TNet().eval(); tnet.debug = True
 with torch.no_grad():
-    ref = tnet(torch.tensor(xr).permute(0, 3, 1, 2)).permute(0, 2, 3, 1).numpy()
+    ref = tnet(xt)
+    dbg = {k: v.permute(0, 2, 3, 1).numpy() for k, v in tnet.dbg.items()}
+sd0 = fnet_stage0(tf.constant(xr))
+print("STAGE diff d0=%.6f d1=%.6f flow0=%.6f mask0=%.6f feat0=%.6f"
+      % (md(sd0[0].numpy(), dbg["d0"]), md(sd0[1].numpy(), dbg["d1"]),
+         md(sd0[2].numpy(), dbg["f0"]), md(sd0[3].numpy(), dbg["m0"]),
+         md(sd0[4].numpy(), dbg["fe0"])))
 got = fnet(tf.constant(xr)).numpy()
-diff = float(np.max(np.abs(ref - got)))
+diff = md(got, ref.permute(0, 2, 3, 1).numpy())
 print("GATE max|diff| = %.6f" % diff)
 assert diff < 1e-3, "torch/tf mismatch too large"
 
