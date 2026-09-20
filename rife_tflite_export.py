@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """RIFE v4.26 -> LiteRT (.tflite), NHWC [1,384,512,7] -> [1,384,512,3].
 Warp собран из TFLite-builtin ops (gather_nd), без grid_sample/Flex.
-CI-гейт: сравнение с PyTorch-эталоном (max|diff| < 1e-3) до конвертации."""
+CI-гейт: сравнение с PyTorch-эталоном (max|diff| < 1e-3) до конвертации.
+Ключи pkl: encode.cnn0..3, block{i}.conv0.0.0/.conv0.1.0,
+block{i}.convblock.{n}.conv/.beta, block{i}.lastconv.0"""
 import os, glob
 import numpy as np
 import torch
@@ -30,6 +32,7 @@ for k, v in raw.items():
     k2 = k
     while k2.startswith("module."): k2 = k2[7:]
     sd[k2] = v
+print("pkl keys:", len(sd))
 
 
 def npw(k): return sd[k].detach().cpu().numpy()
@@ -61,7 +64,7 @@ def tdeconv(key):
 
 
 def twarp(x, flow):
-    N, C, HH, WW = x.shape
+    HH, WW = x.shape[2], x.shape[3]
     ys = torch.arange(HH, dtype=torch.float32); xs = torch.arange(WW, dtype=torch.float32)
     gy, gx = torch.meshgrid(ys, xs, indexing="ij")
     base = torch.stack([gx, gy], -1).unsqueeze(0)
@@ -70,9 +73,9 @@ def twarp(x, flow):
 
 
 class TConvBlock(nn.Module):
-    def __init__(s, pre):
+    def __init__(s, pre):          # pre = block{i}.convblock.{n}
         super().__init__()
-        s.c = tconv(pre + ".c")
+        s.c = tconv(pre + ".conv")
         s.register_buffer("beta", sd[pre + ".beta"])
         s.act = nn.LeakyReLU(0.2)
 
@@ -81,12 +84,13 @@ class TConvBlock(nn.Module):
 
 
 class TBlock(nn.Module):
-    def __init__(s, pre, f):
+    def __init__(s, i, f):
         super().__init__()
         s.f = f
-        s.c0 = tconv(pre + ".c0", 2); s.c1 = tconv(pre + ".c1", 2)
-        s.cb = nn.ModuleList([TConvBlock(pre + ".cb.%d" % i) for i in range(8)])
-        s.last = tdeconv(pre + ".last")
+        s.c0 = tconv("block%d.conv0.0.0" % i, 2)
+        s.c1 = tconv("block%d.conv0.1.0" % i, 2)
+        s.cb = nn.ModuleList([TConvBlock("block%d.convblock.%d" % (i, n)) for n in range(8)])
+        s.last = tdeconv("block%d.lastconv.0" % i)
         s.ps = nn.PixelShuffle(2)
         s.relu = nn.ReLU()
 
@@ -104,8 +108,11 @@ class TBlock(nn.Module):
 class TNet(nn.Module):
     def __init__(s):
         super().__init__()
-        s.e0 = tconv("e0", 2); s.e1 = tconv("e1"); s.e2 = tconv("e2"); s.ed = tdeconv("ed")
-        s.b = nn.ModuleList([TBlock("b%d" % i, FACT[i]) for i in range(5)])
+        s.e0 = tconv("encode.cnn0", 2)
+        s.e1 = tconv("encode.cnn1")
+        s.e2 = tconv("encode.cnn2")
+        s.ed = tdeconv("encode.cnn3")
+        s.b = nn.ModuleList([TBlock(i, FACT[i]) for i in range(5)])
 
     def enc(s, img):
         return s.ed(s.e2(s.e1(s.e0(img))))
@@ -125,19 +132,22 @@ class TNet(nn.Module):
 
 # ---------------- TF-граф (TFLite-builtin) ----------------
 CK = {}; BK = {}; DK = {}; BV = {}
-for pre in ["e0", "e1", "e2"] + ["b%d.c0" % i for i in range(5)] + \
-         ["b%d.c1" % i for i in range(5)] + \
-         ["b%d.cb.%d.c" % (i, n) for i in range(5) for n in range(8)]:
+CONV_KEYS = ["encode.cnn0", "encode.cnn1", "encode.cnn2"] + \
+            ["block%d.conv0.0.0" % i for i in range(5)] + \
+            ["block%d.conv0.1.0" % i for i in range(5)] + \
+            ["block%d.convblock.%d.conv" % (i, n) for i in range(5) for n in range(8)]
+for pre in CONV_KEYS:
     CK[pre] = tf.constant(npw(pre + ".weight").transpose(2, 3, 1, 0).astype(np.float32))
     b = npb(pre)
     BK[pre] = None if b is None else tf.constant(b)
-for pre in ["ed"] + ["b%d.last" % i for i in range(5)]:
+for pre in ["encode.cnn3"] + ["block%d.lastconv.0" % i for i in range(5)]:
     DK[pre] = tf.constant(npw(pre + ".weight").transpose(2, 3, 1, 0).astype(np.float32))
     b = npb(pre)
     BK[pre] = None if b is None else tf.constant(b)
 for i in range(5):
     for n in range(8):
-        BV["b%d.cb.%d.c" % (i, n)] = tf.constant(npw("b%d.cb.%d.beta" % (i, n)).reshape(-1).astype(np.float32))
+        kp = "block%d.convblock.%d.conv" % (i, n)
+        BV[kp] = tf.constant(npw("block%d.convblock.%d.beta" % (i, n)).reshape(-1).astype(np.float32))
 
 
 def conv2d(x, pre, stride):
@@ -177,15 +187,14 @@ def fwarp(x, flow):
 
 def fblock(x, i):
     f = FACT[i]
-    pre = "b%d" % i
     if f > 1:
         x = tf.image.resize(x, [H // f, W // f], method="bilinear", align_corners=False)
-    y = tf.nn.relu(conv2d(x, pre + ".c0", 2))
-    y = tf.nn.relu(conv2d(y, pre + ".c1", 2))
+    y = tf.nn.relu(conv2d(x, "block%d.conv0.0.0" % i, 2))
+    y = tf.nn.relu(conv2d(y, "block%d.conv0.1.0" % i, 2))
     for n in range(8):
-        cp = pre + ".cb.%d.c" % n
+        cp = "block%d.convblock.%d.conv" % (i, n)
         y = tf.nn.leaky_relu(y + conv2d(y, cp, 1) * BV[cp], 0.2)
-    y = tf.nn.depth_to_space(deconv2d(y, pre + ".last"), 2)
+    y = tf.nn.depth_to_space(deconv2d(y, "block%d.lastconv.0" % i), 2)
     if f > 1:
         y = tf.image.resize(y, [H, W], method="bilinear", align_corners=False)
     return y[:, :, :, :4], tf.sigmoid(y[:, :, :, 4:5]), y[:, :, :, 5:13]
@@ -194,8 +203,8 @@ def fblock(x, i):
 @tf.function(input_signature=[tf.TensorSpec([1, H, W, 7], tf.float32)])
 def fnet(x):
     img0 = x[:, :, :, :3]; img1 = x[:, :, :, 3:6]; ts = x[:, :, :, 6:7]
-    d0 = deconv2d(conv2d(conv2d(conv2d(img0, "e0", 2), "e1", 1), "e2", 1), "ed")
-    d1 = deconv2d(conv2d(conv2d(conv2d(img1, "e0", 2), "e1", 1), "e2", 1), "ed")
+    d0 = deconv2d(conv2d(conv2d(conv2d(img0, "encode.cnn0", 2), "encode.cnn1", 1), "encode.cnn2", 1), "encode.cnn3")
+    d1 = deconv2d(conv2d(conv2d(conv2d(img1, "encode.cnn0", 2), "encode.cnn1", 1), "encode.cnn2", 1), "encode.cnn3")
     flow, mask, feat = fblock(tf.concat([img0, img1, d0, d1, ts], -1), 0)
     for i in range(1, 5):
         fa = flow[:, :, :, :2]; fb = flow[:, :, :, 2:4]
