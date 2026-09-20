@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """RIFE v4.26 -> LiteRT (.tflite), NHWC [1,384,512,7] -> [1,384,512,3].
-Warp собран из TFLite-builtin ops (gather_nd), без grid_sample/Flex.
-CI-гейт: сравнение с PyTorch-эталоном (max|diff| < 1e-3) до конвертации."""
+Warp = gather_nd-билинейка (TFLite-builtin), без grid_sample/Flex.
+CI-гейт: постадийный max|diff| torch vs tf (block0..block4 + отдельный warp),
+конвертация только при финальном diff < 1e-3."""
 import os, glob
 import numpy as np
 import torch
@@ -119,19 +120,21 @@ class TNet(nn.Module):
     def forward(s, x):
         img0 = x[:, :3]; img1 = x[:, 3:6]; ts = x[:, 6:7]
         d0 = s.enc(img0); d1 = s.enc(img1)
-        s.dbg["d0"] = d0; s.dbg["d1"] = d1
         flow, mask, feat = s.b[0](torch.cat([img0, img1, d0, d1, ts], 1))
-        s.dbg["f0"] = flow; s.dbg["m0"] = mask; s.dbg["fe0"] = feat
+        s.dbg["b0"] = (flow, mask, feat)
         for i in range(1, 5):
             fa = flow[:, :2]; fb = flow[:, 2:4]
+            if i == 1:
+                s.dbg["w0"] = twarp(img0, fa)
             cat = torch.cat([twarp(img0, fa), twarp(img1, fb), twarp(d0, fa), twarp(d1, fb),
                              ts, mask, feat, flow], 1)
             flow, mask, feat = s.b[i](cat)
+            s.dbg["b%d" % i] = (flow, mask, feat)
         fa = flow[:, :2]; fb = flow[:, 2:4]
         return twarp(img0, fa) * mask + twarp(img1, fb) * (1 - mask)
 
 
-# ---------------- TF-зеркало (TFLite-builtin) ----------------
+# ---------------- TF-зеркало ----------------
 CK = {}; BK = {}; DK = {}; BV = {}
 for k in (["encode.cnn0", "encode.cnn1", "encode.cnn2"]
           + ["block%d.conv0.0.0" % i for i in range(5)]
@@ -171,18 +174,7 @@ def deconv2d(x, key):
     return y if b is None else y + b
 
 
-def pixel_shuffle_tf(x, r=2):
-    """PixelShuffle в DCR-порядке PyTorch (c внешний): reshape+transpose, без depth_to_space."""
-    n = tf.shape(x)[0]; h = tf.shape(x)[1]; w = tf.shape(x)[2]
-    c = x.shape[3] // (r * r)
-    y = tf.reshape(x, [n, h, w, c, r, r])
-    y = tf.transpose(y, [0, 1, 4, 2, 5, 3])   # [n,h,dy,w,dx,c]
-    return tf.reshape(y, [n, h * r, w * r, c])
-
-
 def resize_tf(x, size):
-    # TF2 tf.image.resize bilinear по умолчанию = half-pixel centers
-    # = PyTorch align_corners=False. Kwarg align_corners в TF2 отсутствует.
     return tf.image.resize(x, size, method="bilinear")
 
 
@@ -215,7 +207,7 @@ def fblock(x, i):
     for n in range(8):
         cp = "block%d.convblock.%d.conv" % (i, n)
         y = tf.nn.leaky_relu(y + conv2d(y, cp, 1) * BV[cp], 0.2)
-    y = pixel_shuffle_tf(deconv2d(y, "block%d.lastconv.0" % i), 2)
+    y = tf.nn.depth_to_space(deconv2d(y, "block%d.lastconv.0" % i), 2)
     if f > 1:
         y = resize_tf(y, [H, W])
     return y[..., :4], tf.sigmoid(y[..., 4:5]), y[..., 5:13]
@@ -236,16 +228,7 @@ def fnet(x):
     return fwarp(img0, fa) * mask + fwarp(img1, fb) * (1 - mask)
 
 
-@tf.function(input_signature=[tf.TensorSpec([1, H, W, 7], tf.float32)])
-def fnet_stage0(x):
-    img0 = x[..., :3]; img1 = x[..., 3:6]; ts = x[..., 6:7]
-    d0 = deconv2d(conv2d(conv2d(conv2d(img0, "encode.cnn0", 2), "encode.cnn1", 1), "encode.cnn2", 1), "encode.cnn3")
-    d1 = deconv2d(conv2d(conv2d(conv2d(img1, "encode.cnn0", 2), "encode.cnn1", 1), "encode.cnn2", 1), "encode.cnn3")
-    flow, mask, feat = fblock(tf.concat([img0, img1, d0, d1, ts], -1), 0)
-    return d0, d1, flow, mask, feat
-
-
-# ---------------- гейт + конвертация ----------------
+# ---------------- гейт с локализацией ----------------
 def md(a, b): return float(np.max(np.abs(a - b)))
 
 
@@ -254,13 +237,27 @@ xt = torch.tensor(xr).permute(0, 3, 1, 2)
 tnet = TNet().eval()
 with torch.no_grad():
     ref = tnet(xt)
-    dbg = {k: v.permute(0, 2, 3, 1).numpy() for k, v in tnet.dbg.items()}
-sd0 = fnet_stage0(tf.constant(xr))
-print("STAGE diff d0=%.6f d1=%.6f flow0=%.6f mask0=%.6f feat0=%.6f"
-      % (md(sd0[0].numpy(), dbg["d0"]), md(sd0[1].numpy(), dbg["d1"]),
-         md(sd0[2].numpy(), dbg["f0"]), md(sd0[3].numpy(), dbg["m0"]),
-         md(sd0[4].numpy(), dbg["fe0"])))
-got = fnet(tf.constant(xr)).numpy()
+    dbg = {k: tuple(t.permute(0, 2, 3, 1).numpy() for t in v) if isinstance(v, tuple)
+           else v.permute(0, 2, 3, 1).numpy() for k, v in tnet.dbg.items()}
+
+xi = tf.constant(xr)
+img0 = xi[..., :3]; img1 = xi[..., 3:6]; ts = xi[..., 6:7]
+d0 = deconv2d(conv2d(conv2d(conv2d(img0, "encode.cnn0", 2), "encode.cnn1", 1), "encode.cnn2", 1), "encode.cnn3")
+d1 = deconv2d(conv2d(conv2d(conv2d(img1, "encode.cnn0", 2), "encode.cnn1", 1), "encode.cnn2", 1), "encode.cnn3")
+tflow, tmask, tfeat = fblock(tf.concat([img0, img1, d0, d1, ts], -1), 0)
+print("STAGE b0 flow=%.6f mask=%.6f feat=%.6f"
+      % (md(tflow.numpy(), dbg["b0"][0]), md(tmask.numpy(), dbg["b0"][1]), md(tfeat.numpy(), dbg["b0"][2])))
+print("WARP1 diff=%.6f" % md(fwarp(img0, tflow[..., :2]).numpy(), dbg["w0"]))
+for i in range(1, 5):
+    fa = tflow[..., :2]; fb = tflow[..., 2:4]
+    cat = tf.concat([fwarp(img0, fa), fwarp(img1, fb), fwarp(d0, fa), fwarp(d1, fb),
+                     ts, tmask, tfeat, tflow], -1)
+    tflow, tmask, tfeat = fblock(cat, i)
+    g = dbg["b%d" % i]
+    print("STAGE b%d flow=%.6f mask=%.6f feat=%.6f"
+          % (i, md(tflow.numpy(), g[0]), md(tmask.numpy(), g[1]), md(tfeat.numpy(), g[2])))
+
+got = fnet(xi).numpy()
 diff = md(got, ref.permute(0, 2, 3, 1).numpy())
 print("GATE max|diff| = %.6f" % diff)
 assert diff < 1e-3, "torch/tf mismatch too large"
