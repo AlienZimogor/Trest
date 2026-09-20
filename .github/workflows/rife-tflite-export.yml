@@ -17,16 +17,18 @@ jobs:
           python -m pip install -q "numpy==1.26.4" "protobuf==4.25.3"
           python -m pip install -q torch==2.6.0+cpu --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -q tensorflow==2.16.1
-          # onnx2tf при TF>=2.16 импортирует tf_keras (Keras 3 по умолчанию не подходит)
-          python -m pip install -q tf-keras==2.16.0
+          # onnx2tf при TF>=2.16 импортирует tf_keras; common_functions импортирует psutil
+          python -m pip install -q tf-keras==2.16.0 psutil
           python -m pip install -q onnx==1.16.2 onnx_graphsurgeon onnx2tf
-          # финальный контроль: onnx/onnx2tf/tf-keras не должны были поднять numpy/protobuf
+          # финальный контроль: никто не должен был поднять numpy/protobuf
           python -m pip install -q --force-reinstall --no-deps "numpy==1.26.4" "protobuf==4.25.3"
-          python -c "import numpy, google.protobuf, tensorflow as tf, tf_keras; \
+          # проверка всего стека onnx2tf ДО экспорта: любые скрытые модули упадут здесь
+          python -c "import numpy, google.protobuf, tensorflow as tf, tf_keras, psutil, onnx, onnx_graphsurgeon, onnx2tf; \
                      print('numpy', numpy.__version__); \
                      print('protobuf', google.protobuf.__version__); \
                      print('tf', tf.__version__); \
-                     print('tf_keras', tf_keras.__version__)"
+                     print('tf_keras', tf_keras.__version__); \
+                     print('onnx2tf stack ok')"
 
       - name: download release zip
         env:
