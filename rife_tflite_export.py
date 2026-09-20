@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""RIFE v4.26 -> LiteRT (.tflite), без onnx/pnnx/ncnn.
-Граф строится в TF2 только из TFLite-builtin ops (conv/transpose_conv/
-depth_to_space/resize_bilinear/gather_nd-warp). Веса портируются NCHW->NHWC.
-CI-гейт: сверка TF-графа с PyTorch-eager на одном входе (max abs diff)."""
+"""RIFE v4.26 -> LiteRT (.tflite), NHWC [1,384,512,7] -> [1,384,512,3].
+Warp собран из TFLite-builtin ops (gather_nd), без grid_sample/Flex.
+CI-гейт: сравнение с PyTorch-эталоном (max|diff| < 1e-3) до конвертации."""
 import os, glob
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import tensorflow as tf
 
 H, W = 384, 512
 FACT = [16, 8, 4, 2, 1]
-C0 = [96, 64, 48, 32, 16]
-C1 = [192, 128, 96, 64, 32]
 
 
 def _pref(p):
@@ -33,131 +32,194 @@ for k, v in raw.items():
     sd[k2] = v
 
 
-def N(k): return sd[k].detach().cpu().numpy()
-def CK(k): return np.ascontiguousarray(N(k).transpose(2, 3, 1, 0), dtype=np.float32)
-def BS(k):
-    b = sd.get(k)
+def npw(k): return sd[k].detach().cpu().numpy()
+
+
+def npb(k):
+    b = sd.get(k + ".bias")
     return None if b is None else b.detach().cpu().numpy().astype(np.float32)
-def BT(k): return np.ascontiguousarray(N(k).reshape(1, 1, 1, -1), dtype=np.float32)
 
 
-def conv(x, wk, bk, s):
-    y = tf.nn.conv2d(x, tf.constant(CK(wk)), strides=s, padding="SAME")
-    b = BS(bk)
-    return y if b is None else y + tf.constant(b)
+# ---------------- PyTorch-эталон (для гейта точности) ----------------
+def tconv(key, stride=1):
+    w = sd[key + ".weight"]; b = sd.get(key + ".bias")
+    c = nn.Conv2d(w.shape[1], w.shape[0], w.shape[2], stride, w.shape[2] // 2,
+                  bias=(b is not None))
+    with torch.no_grad():
+        c.weight.copy_(w)
+        if b is not None: c.bias.copy_(b)
+    return c
 
 
-def deconv(x, wk, bk, out_ch):
-    os_ = tf.stack([1, tf.shape(x)[1] * 2, tf.shape(x)[2] * 2, out_ch])
-    y = tf.nn.conv2d_transpose(x, tf.constant(CK(wk)), output_shape=os_,
-                               strides=2, padding="SAME")
-    b = BS(bk)
-    return y if b is None else y + tf.constant(b)
+def tdeconv(key):
+    w = sd[key + ".weight"]; b = sd.get(key + ".bias")
+    c = nn.ConvTranspose2d(w.shape[0], w.shape[1], w.shape[2], 2, 1, bias=(b is not None))
+    with torch.no_grad():
+        c.weight.copy_(w)
+        if b is not None: c.bias.copy_(b)
+    return c
 
 
-def warp(x, flow):
-    """x (1,H,W,C), flow (1,H,W,2) в пиксельных смещениях; TFLite-safe."""
-    Hs = tf.shape(x)[1]; Ws = tf.shape(x)[2]
-    iy, ix = tf.meshgrid(tf.range(Hs, dtype=tf.float32),
-                         tf.range(Ws, dtype=tf.float32), indexing="ij")
-    gx = ix + flow[0, :, :, 0]; gy = iy + flow[0, :, :, 1]
-    x0 = tf.floor(gx); y0 = tf.floor(gy)
-    valid = (gx >= 0) & (gy >= 0) & \
-            (gx <= tf.cast(Ws - 1, tf.float32)) & (gy <= tf.cast(Hs - 1, tf.float32))
-    cx0 = tf.clip_by_value(tf.cast(x0, tf.int32), 0, Ws - 1)
-    cy0 = tf.clip_by_value(tf.cast(y0, tf.int32), 0, Hs - 1)
-    cx1 = tf.clip_by_value(cx0 + 1, 0, Ws - 1)
-    cy1 = tf.clip_by_value(cy0 + 1, 0, Hs - 1)
-    x3 = x[0]
-    idx = lambda cy, cx: tf.gather_nd(x3, tf.stack([cy, cx], axis=-1))
-    v00 = idx(cy0, cx0); v01 = idx(cy0, cx1); v10 = idx(cy1, cx0); v11 = idx(cy1, cx1)
-    ax = (gx - x0)[..., None]; ay = (gy - y0)[..., None]
-    out = (v00 * (1 - ax) + v01 * ax) * (1 - ay) + (v10 * (1 - ax) + v11 * ax) * ay
-    out = out * tf.cast(valid[..., None], tf.float32)
-    return out[None]
-
-
-def convblock(x, pre, ch):
-    c = conv(x, pre + ".conv.weight", pre + ".conv.bias", 1)
-    c = c * tf.constant(BT(pre + ".beta"))
-    return tf.nn.leaky_relu(x + c, 0.2)
-
-
-def block(x, i, flow):
-    pre = "block%d" % i
-    if i == 0:
-        cur = x
-    else:
-        fa = flow[..., :2]; fb = flow[..., 2:4]
-        w0 = warp(x[..., 0:3], fa); w1 = warp(x[..., 3:6], fb)
-        w2 = warp(x[..., 6:10], fa); w3 = warp(x[..., 10:14], fb)
-        cur = tf.concat([w0, w1, w2, w3, x[..., 14:15], x[..., 15:16], x[..., 16:24]], -1)
-    f = FACT[i]
-    if f > 1:
-        cur = tf.image.resize(cur, [H // f, W // f], method="bilinear", align_corners=False)
-    cur = tf.nn.relu(conv(cur, pre + ".c0.weight", pre + ".c0.bias", 2))
-    cur = tf.nn.relu(conv(cur, pre + ".c1.weight", pre + ".c1.bias", 2))
-    for n in range(8):
-        cur = convblock(cur, pre + ".cb.%d" % n, C1[i])
-    cur = deconv(cur, pre + ".last.weight", pre + ".last.bias", 52)
-    cur = tf.nn.depth_to_space(cur, 2)
-    if f > 1:
-        cur = tf.image.resize(cur, [H, W], method="bilinear", align_corners=False)
-    return cur  # 13 = flow4 + mask1 + feat8
-
-
-class Net(tf.Module):
-    @tf.function(input_signature=[tf.TensorSpec([1, H, W, 7], tf.float32)])
-    def __call__(self, x):
-        img0 = x[..., 0:3]; img1 = x[..., 3:6]; ts = x[..., 6:7]
-        def enc(img):
-            y = conv(img, "encode.cnn0.weight", "encode.cnn0.bias", 2)
-            y = conv(y, "encode.cnn1.weight", "encode.cnn1.bias", 1)
-            y = conv(y, "encode.cnn2.weight", "encode.cnn2.bias", 1)
-            return deconv(y, "encode.cnn3.weight", "encode.cnn3.bias", 4)
-        d0 = enc(img0); d1 = enc(img1)
-        cat0 = tf.concat([img0, img1, d0, d1, ts], -1)          # 15
-        out13 = block(cat0, 0, None)
-        flow = out13[..., 0:4]; mask = out13[..., 4:5]; feat = out13[..., 5:13]
-        state = tf.concat([img0, img1, d0, d1, ts, flow, mask, feat], -1)  # 28? no: 3+3+4+4+1+4+1+8=28
-        for i in (1, 2, 3, 4):
-            out13 = block(state, i, flow)
-            flow = out13[..., 0:4]; mask = out13[..., 4:5]; feat = out13[..., 5:13]
-            state = tf.concat([img0, img1, d0, d1, ts, flow, mask, feat], -1)
-        w0 = warp(img0, flow[..., :2]); w1 = warp(img1, flow[..., 2:4])
-        return w0 * mask + w1 * (1.0 - mask)
-
-
-net = Net()
-concrete = net.__call__.get_concrete_function()
-conv_res = tf.lite.TFLiteConverter.from_concrete_functions([concrete], net)
-conv_res.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
-tfl = conv_res.convert()
-open("rife_v426.tflite", "wb").write(tfl)
-print("wrote rife_v426.tflite %d B" % os.path.getsize("rife_v426.tflite"))
-
-# --- численная сверка TF vs PyTorch на одном входе ---
-import torch.nn as Tnn
-import torch.nn.functional as F
-
-
-def pw(x, w, b, s):
-    return F.conv2d(x, torch.tensor(N(w)), None if b is None or sd.get(b) is None else torch.tensor(N(b)),
-                    stride=s, padding=1)
-
-
-def pwarp(x, fl):
-    Nn, C, HH, WW = x.shape
+def twarp(x, flow):
+    N, C, HH, WW = x.shape
     ys = torch.arange(HH, dtype=torch.float32); xs = torch.arange(WW, dtype=torch.float32)
     gy, gx = torch.meshgrid(ys, xs, indexing="ij")
     base = torch.stack([gx, gy], -1).unsqueeze(0)
-    vg = base + fl.permute(0, 2, 3, 1)
-    vg = torch.stack([2 * vg[..., 0] / (WW - 1) - 1, 2 * vg[..., 1] / (HH - 1) - 1], -1)
+    vg = base + flow.permute(0, 2, 3, 1)
     return F.grid_sample(x, vg, align_corners=True, padding_mode="zeros")
 
 
-# сверяем только encode+block0 (достаточно для валидации порта весов)
-xr = torch.rand(1, 7, H, W)
-x_tf = tf.constant(np.ascontiguousarray(xr.numpy().transpose(0, 2, 3, 1)))
-y_tf = net(x_tf).numpy()
-print("tf out mean=%.5f" % float(y_tf.mean()))
+class TConvBlock(nn.Module):
+    def __init__(s, pre):
+        super().__init__()
+        s.c = tconv(pre + ".c")
+        s.register_buffer("beta", sd[pre + ".beta"])
+        s.act = nn.LeakyReLU(0.2)
+
+    def forward(s, x):
+        return s.act(x + s.c(x) * s.beta)
+
+
+class TBlock(nn.Module):
+    def __init__(s, pre, f):
+        super().__init__()
+        s.f = f
+        s.c0 = tconv(pre + ".c0", 2); s.c1 = tconv(pre + ".c1", 2)
+        s.cb = nn.ModuleList([TConvBlock(pre + ".cb.%d" % i) for i in range(8)])
+        s.last = tdeconv(pre + ".last")
+        s.ps = nn.PixelShuffle(2)
+        s.relu = nn.ReLU()
+
+    def forward(s, x):
+        if s.f > 1:
+            x = F.interpolate(x, scale_factor=1.0 / s.f, mode="bilinear", align_corners=False)
+        y = s.relu(s.c0(x)); y = s.relu(s.c1(y))
+        for cb in s.cb: y = cb(y)
+        y = s.ps(s.last(y))
+        if s.f > 1:
+            y = F.interpolate(y, scale_factor=float(s.f), mode="bilinear", align_corners=False)
+        return y[:, :4], torch.sigmoid(y[:, 4:5]), y[:, 5:13]
+
+
+class TNet(nn.Module):
+    def __init__(s):
+        super().__init__()
+        s.e0 = tconv("e0", 2); s.e1 = tconv("e1"); s.e2 = tconv("e2"); s.ed = tdeconv("ed")
+        s.b = nn.ModuleList([TBlock("b%d" % i, FACT[i]) for i in range(5)])
+
+    def enc(s, img):
+        return s.ed(s.e2(s.e1(s.e0(img))))
+
+    def forward(s, x):
+        img0 = x[:, :3]; img1 = x[:, 3:6]; ts = x[:, 6:7]
+        d0 = s.enc(img0); d1 = s.enc(img1)
+        flow, mask, feat = s.b[0](torch.cat([img0, img1, d0, d1, ts], 1))
+        for i in range(1, 5):
+            fa = flow[:, :2]; fb = flow[:, 2:4]
+            cat = torch.cat([twarp(img0, fa), twarp(img1, fb), twarp(d0, fa), twarp(d1, fb),
+                             ts, mask, feat, flow], 1)
+            flow, mask, feat = s.b[i](cat)
+        fa = flow[:, :2]; fb = flow[:, 2:4]
+        return twarp(img0, fa) * mask + twarp(img1, fb) * (1 - mask)
+
+
+# ---------------- TF-граф (TFLite-builtin) ----------------
+CK = {}; BK = {}; DK = {}; BV = {}
+for pre in ["e0", "e1", "e2"] + ["b%d.c0" % i for i in range(5)] + \
+         ["b%d.c1" % i for i in range(5)] + \
+         ["b%d.cb.%d.c" % (i, n) for i in range(5) for n in range(8)]:
+    CK[pre] = tf.constant(npw(pre + ".weight").transpose(2, 3, 1, 0).astype(np.float32))
+    b = npb(pre)
+    BK[pre] = None if b is None else tf.constant(b)
+for pre in ["ed"] + ["b%d.last" % i for i in range(5)]:
+    DK[pre] = tf.constant(npw(pre + ".weight").transpose(2, 3, 1, 0).astype(np.float32))
+    b = npb(pre)
+    BK[pre] = None if b is None else tf.constant(b)
+for i in range(5):
+    for n in range(8):
+        BV["b%d.cb.%d.c" % (i, n)] = tf.constant(npw("b%d.cb.%d.beta" % (i, n)).reshape(-1).astype(np.float32))
+
+
+def conv2d(x, pre, stride):
+    y = tf.nn.conv2d(x, CK[pre], strides=[1, stride, stride, 1], padding="SAME")
+    return y if BK[pre] is None else tf.nn.bias_add(y, BK[pre])
+
+
+def deconv2d(x, pre):
+    s = tf.shape(x)
+    y = tf.nn.conv2d_transpose(x, DK[pre],
+                               output_shape=[s[0], s[1] * 2, s[2] * 2, DK[pre].shape[2]],
+                               strides=[1, 2, 2, 1], padding="SAME")
+    return y if BK[pre] is None else tf.nn.bias_add(y, BK[pre])
+
+
+def fwarp(x, flow):
+    xx = x[0]; ff = flow[0]
+    Hh = tf.shape(xx)[0]; Ww = tf.shape(xx)[1]
+    ys = tf.cast(tf.range(Hh), tf.float32)[:, None] * tf.ones([Hh, Ww])
+    xs = tf.cast(tf.range(Ww), tf.float32)[None, :] * tf.ones([Hh, Ww])
+    gx = xs + ff[:, :, 0]; gy = ys + ff[:, :, 1]
+    x0 = tf.floor(gx); y0 = tf.floor(gy)
+    valid = (gx >= 0) & (gy >= 0) & (gx <= tf.cast(Ww - 1, tf.float32)) & (gy <= tf.cast(Hh - 1, tf.float32))
+    cx0 = tf.clip_by_value(tf.cast(x0, tf.int32), 0, Ww - 1)
+    cy0 = tf.clip_by_value(tf.cast(y0, tf.int32), 0, Hh - 1)
+    cx1 = tf.clip_by_value(cx0 + 1, 0, Ww - 1)
+    cy1 = tf.clip_by_value(cy0 + 1, 0, Hh - 1)
+    v00 = tf.gather_nd(xx, tf.stack([cy0, cx0], -1))
+    v01 = tf.gather_nd(xx, tf.stack([cy0, cx1], -1))
+    v10 = tf.gather_nd(xx, tf.stack([cy1, cx0], -1))
+    v11 = tf.gather_nd(xx, tf.stack([cy1, cx1], -1))
+    ax = (gx - x0)[:, :, None]; ay = (gy - y0)[:, :, None]
+    out = (v00 * (1 - ax) + v01 * ax) * (1 - ay) + (v10 * (1 - ax) + v11 * ax) * ay
+    out = out * tf.cast(valid[:, :, None], tf.float32)
+    return out[None]
+
+
+def fblock(x, i):
+    f = FACT[i]
+    pre = "b%d" % i
+    if f > 1:
+        x = tf.image.resize(x, [H // f, W // f], method="bilinear", align_corners=False)
+    y = tf.nn.relu(conv2d(x, pre + ".c0", 2))
+    y = tf.nn.relu(conv2d(y, pre + ".c1", 2))
+    for n in range(8):
+        cp = pre + ".cb.%d.c" % n
+        y = tf.nn.leaky_relu(y + conv2d(y, cp, 1) * BV[cp], 0.2)
+    y = tf.nn.depth_to_space(deconv2d(y, pre + ".last"), 2)
+    if f > 1:
+        y = tf.image.resize(y, [H, W], method="bilinear", align_corners=False)
+    return y[:, :, :, :4], tf.sigmoid(y[:, :, :, 4:5]), y[:, :, :, 5:13]
+
+
+@tf.function(input_signature=[tf.TensorSpec([1, H, W, 7], tf.float32)])
+def fnet(x):
+    img0 = x[:, :, :, :3]; img1 = x[:, :, :, 3:6]; ts = x[:, :, :, 6:7]
+    d0 = deconv2d(conv2d(conv2d(conv2d(img0, "e0", 2), "e1", 1), "e2", 1), "ed")
+    d1 = deconv2d(conv2d(conv2d(conv2d(img1, "e0", 2), "e1", 1), "e2", 1), "ed")
+    flow, mask, feat = fblock(tf.concat([img0, img1, d0, d1, ts], -1), 0)
+    for i in range(1, 5):
+        fa = flow[:, :, :, :2]; fb = flow[:, :, :, 2:4]
+        cat = tf.concat([fwarp(img0, fa), fwarp(img1, fb), fwarp(d0, fa), fwarp(d1, fb),
+                         ts, mask, feat, flow], -1)
+        flow, mask, feat = fblock(cat, i)
+    fa = flow[:, :, :, :2]; fb = flow[:, :, :, 2:4]
+    return fwarp(img0, fa) * mask + fwarp(img1, fb) * (1 - mask)
+
+
+# ---------------- гейт точности + конвертация ----------------
+xr = np.random.RandomState(0).rand(1, H, W, 7).astype(np.float32)
+tnet = TNet().eval()
+with torch.no_grad():
+    ref = tnet(torch.tensor(xr).permute(0, 3, 1, 2)).permute(0, 2, 3, 1).numpy()
+got = fnet(tf.constant(xr)).numpy()
+diff = float(np.max(np.abs(ref - got)))
+print("GATE max|diff| = %.6f" % diff)
+assert diff < 1e-3, "torch/tf mismatch too large"
+
+conv = tf.lite.TFLiteConverter.from_concrete_functions(
+    [fnet.get_concrete_function()], fnet)
+conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
+conv.allow_custom_ops = False
+tfl = conv.convert()
+open("rife_v426.tflite", "wb").write(tfl)
+print("wrote rife_v426.tflite %d B" % os.path.getsize("rife_v426.tflite"))
