@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """RIFE v4.26 -> LiteRT (.tflite), NHWC [1,384,512,7] -> [1,384,512,3].
 Warp = gather_nd-билинейка (TFLite-builtin), pixel_shuffle = reshape+transpose (DCR).
-CI-гейт: постадийный max|diff| torch vs tf (b0..b4 + WARP1), конвертация при diff < 1e-3."""
+CI-гейт: постадийный max|diff| torch vs tf + изоляция warp/cat/fblock3;
+конвертация только при финальном diff < 1e-3."""
 import os, glob
 import numpy as np
 import torch
@@ -123,10 +124,10 @@ class TNet(nn.Module):
         s.dbg["b0"] = (flow, mask, feat)
         for i in range(1, 5):
             fa = flow[:, :2]; fb = flow[:, 2:4]
-            if i == 1:
-                s.dbg["w0"] = twarp(img0, fa)
+            s.dbg["w%d" % i] = twarp(img0, fa)
             cat = torch.cat([twarp(img0, fa), twarp(img1, fb), twarp(d0, fa), twarp(d1, fb),
                              ts, mask, feat, flow], 1)
+            s.dbg["cat%d" % i] = cat
             flow, mask, feat = s.b[i](cat)
             s.dbg["b%d" % i] = (flow, mask, feat)
         fa = flow[:, :2]; fb = flow[:, 2:4]
@@ -174,11 +175,10 @@ def deconv2d(x, key):
 
 
 def pixel_shuffle_tf(x, r=2):
-    """PixelShuffle в DCR-порядке PyTorch (c внешний): reshape+transpose, НЕ depth_to_space."""
     n = tf.shape(x)[0]; h = tf.shape(x)[1]; w = tf.shape(x)[2]
     c = x.shape[3] // (r * r)
     y = tf.reshape(x, [n, h, w, c, r, r])
-    y = tf.transpose(y, [0, 1, 4, 2, 5, 3])   # [n,h,dy,w,dx,c]
+    y = tf.transpose(y, [0, 1, 4, 2, 5, 3])
     return tf.reshape(y, [n, h * r, w * r, c])
 
 
@@ -236,7 +236,7 @@ def fnet(x):
     return fwarp(img0, fa) * mask + fwarp(img1, fb) * (1 - mask)
 
 
-# ---------------- гейт с локализацией ----------------
+# ---------------- гейт с изоляцией ----------------
 def md(a, b): return float(np.max(np.abs(a - b)))
 
 
@@ -245,8 +245,12 @@ xt = torch.tensor(xr).permute(0, 3, 1, 2)
 tnet = TNet().eval()
 with torch.no_grad():
     ref = tnet(xt)
-    dbg = {k: tuple(t.permute(0, 2, 3, 1).numpy() for t in v) if isinstance(v, tuple)
-           else v.permute(0, 2, 3, 1).numpy() for k, v in tnet.dbg.items()}
+    dbg = {}
+    for k, v in tnet.dbg.items():
+        if isinstance(v, tuple):
+            dbg[k] = tuple(t.permute(0, 2, 3, 1).numpy() for t in v)
+        else:
+            dbg[k] = v.permute(0, 2, 3, 1).numpy()
 
 xi = tf.constant(xr)
 img0 = xi[..., :3]; img1 = xi[..., 3:6]; ts = xi[..., 6:7]
@@ -256,15 +260,20 @@ tflow, tmask, tfeat = fblock(tf.concat([img0, img1, d0, d1, ts], -1), 0)
 g = dbg["b0"]
 print("STAGE b0 flow=%.6f mask=%.6f feat=%.6f"
       % (md(tflow.numpy(), g[0]), md(tmask.numpy(), g[1]), md(tfeat.numpy(), g[2])))
-print("WARP1 diff=%.6f" % md(fwarp(img0, tflow[..., :2]).numpy(), dbg["w0"]))
 for i in range(1, 5):
     fa = tflow[..., :2]; fb = tflow[..., 2:4]
-    cat = tf.concat([fwarp(img0, fa), fwarp(img1, fb), fwarp(d0, fa), fwarp(d1, fb),
-                     ts, tmask, tfeat, tflow], -1)
+    w0 = fwarp(img0, fa); w1 = fwarp(img1, fb); wd0 = fwarp(d0, fa); wd1 = fwarp(d1, fb)
+    print("WARP%d img0 diff=%.6f" % (i, md(w0.numpy(), dbg["w%d" % i])))
+    cat = tf.concat([w0, w1, wd0, wd1, ts, tmask, tfeat, tflow], -1)
+    print("CAT%d diff=%.6f" % (i, md(cat.numpy(), dbg["cat%d" % i])))
     tflow, tmask, tfeat = fblock(cat, i)
     g = dbg["b%d" % i]
     print("STAGE b%d flow=%.6f mask=%.6f feat=%.6f"
           % (i, md(tflow.numpy(), g[0]), md(tmask.numpy(), g[1]), md(tfeat.numpy(), g[2])))
+iso3 = fblock(tf.constant(dbg["cat3"]), 3)
+g3 = dbg["b3"]
+print("ISO fblock3 flow=%.6f mask=%.6f feat=%.6f"
+      % (md(iso3[0].numpy(), g3[0]), md(iso3[1].numpy(), g3[1]), md(iso3[2].numpy(), g3[2])))
 
 got = fnet(xi).numpy()
 diff = md(got, ref.permute(0, 2, 3, 1).numpy())
