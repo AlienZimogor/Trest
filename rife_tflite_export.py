@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""RIFE v4.26 -> LiteRT (.tflite) через ONNX(opset16) + onnx2tf.
-Числовой гейт: torch-эталон vs tflite (max|diff| < 1e-3) до публикации артефакта."""
+"""RIFE v4.26 -> LiteRT (.tflite) через ONNX(opset16) + onnxsim + onnx2tf.
+onnxsim сворачивает Expand/meshgrid (иначе onnx2tf падает на Expand).
+Если onnx2tf сгенерировал auto.json — перезапускаем с -prf.
+Числовой гейт torch vs tflite остаётся финальным арбитром."""
 import os, glob, shutil, subprocess
 import numpy as np
 import torch
@@ -119,7 +121,7 @@ class TNet(nn.Module):
 
 net = TNet().eval()
 
-# ---- 1) ONNX (opset 16: нативный GridSample) ----
+# ---- 1) torch -> ONNX (opset 16, нативный GridSample) ----
 xr_t = torch.tensor(np.random.RandomState(0).rand(1, 7, H, W).astype(np.float32))
 with torch.no_grad():
     ref = net(xr_t).numpy()
@@ -128,17 +130,42 @@ torch.onnx.export(net, xr_t, "rife_v426.onnx", opset_version=16,
                   do_constant_folding=True)
 print("wrote rife_v426.onnx %d B" % os.path.getsize("rife_v426.onnx"))
 
-# ---- 2) onnx2tf -> TFLite (NHWC, float32) ----
+# ---- 2) onnxsim: сворачиваем Expand/meshgrid/broadcasting ----
+# Без этого onnx2tf падает на wa/Expand с Keras-Functional ValueError.
+try:
+    import onnxsim
+    simplified, ok = onnxsim.simplify("rife_v426.onnx")
+    if ok:
+        with open("rife_v426_sim.onnx", "wb") as f:
+            f.write(simplified.SerializeToString())
+        onnx_src = "rife_v426_sim.onnx"
+        print("onnxsim ok: %d B -> %d B" %
+              (os.path.getsize("rife_v426.onnx"), os.path.getsize(onnx_src)))
+    else:
+        onnx_src = "rife_v426.onnx"
+        print("onnxsim не подтвердил, используем оригинал")
+except Exception as e:
+    onnx_src = "rife_v426.onnx"
+    print("onnxsim exception (%s), используем оригинал" % e)
+
+# ---- 3) onnx2tf -> TFLite (с fallback на auto-generated JSON) ----
 if os.path.isdir("tfl_out"): shutil.rmtree("tfl_out")
-subprocess.run(["onnx2tf", "-i", "rife_v426.onnx", "-o", "tfl_out",
-                "-b", "1"], check=True)
+cmd1 = ["onnx2tf", "-i", onnx_src, "-o", "tfl_out", "-b", "1",
+        "-ois", "in0:1,7,384,512"]
+r1 = subprocess.run(cmd1)
+auto_json = "tfl_out/rife_v426_auto.json"
+if r1.returncode != 0 and os.path.isfile(auto_json):
+    print("onnx2tf pass 1 failed, retrying with -prf auto.json")
+    cmd2 = cmd1 + ["-prf", auto_json]
+    subprocess.run(cmd2, check=True)
+
 cand = [f for f in os.listdir("tfl_out") if f.endswith(".tflite") and "float32" in f] \
     or [f for f in os.listdir("tfl_out") if f.endswith(".tflite")]
 assert cand, "no tflite produced"
 src = os.path.join("tfl_out", cand[0])
 print("onnx2tf produced:", src)
 
-# ---- 3) числовой гейт torch vs tflite ----
+# ---- 4) числовой гейт torch vs tflite ----
 xr = xr_t.numpy().transpose(0, 2, 3, 1)  # NHWC
 interp = tf.lite.Interpreter(model_path=src)
 interp.allocate_tensors()
