@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """RIFE v4.26 -> LiteRT (.tflite), NHWC [1,384,512,7] -> [1,384,512,3].
-Warp = TFLite-builtin gather_nd (без grid_sample/Flex).
-ГЕЙТ: постадийный max|diff| torch vs tf; конвертация только при diff < 1e-3.
- Padding-семантика PyTorch воспроизведена явно:
-   conv stride=2  -> tf.pad(1) + VALID
-   conv stride=1  -> SAME (== pad1)
-   deconv k4 s2 p1-> VALID + кроп 1 с каждой стороны"""
+Warp = gather_nd-билинейка (TFLite-builtin), pixel_shuffle = reshape+transpose (DCR).
+CI-гейт: постадийный max|diff| torch vs tf; конвертация только при diff < 1e-3."""
 import os, glob
 import numpy as np
 import torch
@@ -115,7 +111,6 @@ class TNet(nn.Module):
         s.e0 = tconv("encode.cnn0", 2); s.e1 = tconv("encode.cnn1")
         s.e2 = tconv("encode.cnn2"); s.ed = tdeconv("encode.cnn3")
         s.b = nn.ModuleList([TBlock(i, FACT[i]) for i in range(5)])
-        s.debug = False
         s.dbg = {}
 
     def enc(s, img):
@@ -124,10 +119,9 @@ class TNet(nn.Module):
     def forward(s, x):
         img0 = x[:, :3]; img1 = x[:, 3:6]; ts = x[:, 6:7]
         d0 = s.enc(img0); d1 = s.enc(img1)
-        if s.debug: s.dbg["d0"] = d0; s.dbg["d1"] = d1
+        s.dbg["d0"] = d0; s.dbg["d1"] = d1
         flow, mask, feat = s.b[0](torch.cat([img0, img1, d0, d1, ts], 1))
-        if s.debug:
-            s.dbg["f0"] = flow; s.dbg["m0"] = mask; s.dbg["fe0"] = feat
+        s.dbg["f0"] = flow; s.dbg["m0"] = mask; s.dbg["fe0"] = feat
         for i in range(1, 5):
             fa = flow[:, :2]; fb = flow[:, 2:4]
             cat = torch.cat([twarp(img0, fa), twarp(img1, fb), twarp(d0, fa), twarp(d1, fb),
@@ -138,39 +132,56 @@ class TNet(nn.Module):
 
 
 # ---------------- TF-зеркало (TFLite-builtin) ----------------
-CK = {}; BK = {}; DK = {}
-CONV_KEYS = ["encode.cnn0", "encode.cnn1", "encode.cnn2"] + \
-            ["block%d.conv0.0.0" % i for i in range(5)] + \
-            ["block%d.conv0.1.0" % i for i in range(5)] + \
-            ["block%d.convblock.%d.conv" % (i, n) for i in range(5) for n in range(8)]
-for pre in CONV_KEYS:
-    CK[pre] = tf.constant(npw(pre + ".weight").transpose(2, 3, 1, 0).astype(np.float32))
-    b = npb(pre)
-    BK[pre] = None if b is None else tf.constant(b)
-for pre in ["encode.cnn3"] + ["block%d.lastconv.0" % i for i in range(5)]:
-    DK[pre] = tf.constant(npw(pre + ".weight").transpose(2, 3, 1, 0).astype(np.float32))
-    b = npb(pre)
-    BK[pre] = None if b is None else tf.constant(b)
+CK = {}; BK = {}; DK = {}; BV = {}
+for k in (["encode.cnn0", "encode.cnn1", "encode.cnn2"]
+          + ["block%d.conv0.0.0" % i for i in range(5)]
+          + ["block%d.conv0.1.0" % i for i in range(5)]
+          + ["block%d.convblock.%d.conv" % (i, n) for i in range(5) for n in range(8)]):
+    CK[k] = tf.constant(npw(k + ".weight").transpose(2, 3, 1, 0).astype(np.float32))
+    b = npb(k)
+    BK[k] = None if b is None else tf.constant(b)
+for k in ["encode.cnn3"] + ["block%d.lastconv.0" % i for i in range(5)]:
+    DK[k] = tf.constant(npw(k + ".weight").transpose(2, 3, 1, 0).astype(np.float32))
+    b = npb(k)
+    BK[k] = None if b is None else tf.constant(b)
+for i in range(5):
+    for n in range(8):
+        BV["block%d.convblock.%d.conv" % (i, n)] = tf.constant(
+            npw("block%d.convblock.%d.beta" % (i, n)).reshape(-1).astype(np.float32))
 
 
-def conv2d(x, pre, stride):
+def conv2d(x, key, stride):
     if stride == 1:
-        y = tf.nn.conv2d(x, CK[pre], strides=1, padding="SAME")
+        y = tf.nn.conv2d(x, CK[key], strides=1, padding="SAME")
     else:
         xp = tf.pad(x, [[0, 0], [1, 1], [1, 1], [0, 0]])
-        y = tf.nn.conv2d(xp, CK[pre], strides=stride, padding="VALID")
-    b = BK[pre]
+        y = tf.nn.conv2d(xp, CK[key], strides=stride, padding="VALID")
+    b = BK[key]
     return y if b is None else y + b
 
 
-def deconv2d(x, pre):
+def deconv2d(x, key):
+    w = DK[key]
     s = tf.shape(x)
-    y = tf.nn.conv2d_transpose(x, DK[pre],
-                               output_shape=[s[0], s[1] * 2 + 2, s[2] * 2 + 2, DK[pre].shape[2]],
+    y = tf.nn.conv2d_transpose(x, w,
+                               output_shape=[s[0], s[1] * 2 + 2, s[2] * 2 + 2, w.shape[2]],
                                strides=2, padding="VALID")
     y = y[:, 1:-1, 1:-1, :]
-    b = BK[pre]
+    b = BK[key]
     return y if b is None else y + b
+
+
+def pixel_shuffle_tf(x, r=2):
+    """PixelShuffle в DCR-порядке PyTorch (c внешний): reshape+transpose, без depth_to_space."""
+    n = tf.shape(x)[0]; h = tf.shape(x)[1]; w = tf.shape(x)[2]
+    c = x.shape[3] // (r * r)
+    y = tf.reshape(x, [n, h, w, c, r, r])
+    y = tf.transpose(y, [0, 1, 4, 2, 5, 3])   # [n,h,dy,w,dx,c]
+    return tf.reshape(y, [n, h * r, w * r, c])
+
+
+def resize_tf(x, size):
+    return tf.image.resize(x, size, method="bilinear", align_corners=False)
 
 
 def fwarp(x, flow):
@@ -196,37 +207,36 @@ def fwarp(x, flow):
 def fblock(x, i):
     f = FACT[i]
     if f > 1:
-        x = tf.image.resize(x, [H // f, W // f], method="bilinear")
+        x = resize_tf(x, [H // f, W // f])
     y = tf.nn.relu(conv2d(x, "block%d.conv0.0.0" % i, 2))
     y = tf.nn.relu(conv2d(y, "block%d.conv0.1.0" % i, 2))
     for n in range(8):
         cp = "block%d.convblock.%d.conv" % (i, n)
-        y = tf.nn.leaky_relu(y + conv2d(y, cp, 1) * tf.constant(
-            npw("block%d.convblock.%d.beta" % (i, n)).reshape(-1).astype(np.float32)), 0.2)
-    y = tf.nn.depth_to_space(deconv2d(y, "block%d.lastconv.0" % i), 2)
+        y = tf.nn.leaky_relu(y + conv2d(y, cp, 1) * BV[cp], 0.2)
+    y = pixel_shuffle_tf(deconv2d(y, "block%d.lastconv.0" % i), 2)
     if f > 1:
-        y = tf.image.resize(y, [H, W], method="bilinear")
-    return y[:, :, :, :4], tf.sigmoid(y[:, :, :, 4:5]), y[:, :, :, 5:13]
+        y = resize_tf(y, [H, W])
+    return y[..., :4], tf.sigmoid(y[..., 4:5]), y[..., 5:13]
 
 
 @tf.function(input_signature=[tf.TensorSpec([1, H, W, 7], tf.float32)])
 def fnet(x):
-    img0 = x[:, :, :, :3]; img1 = x[:, :, :, 3:6]; ts = x[:, :, :, 6:7]
+    img0 = x[..., :3]; img1 = x[..., 3:6]; ts = x[..., 6:7]
     d0 = deconv2d(conv2d(conv2d(conv2d(img0, "encode.cnn0", 2), "encode.cnn1", 1), "encode.cnn2", 1), "encode.cnn3")
     d1 = deconv2d(conv2d(conv2d(conv2d(img1, "encode.cnn0", 2), "encode.cnn1", 1), "encode.cnn2", 1), "encode.cnn3")
     flow, mask, feat = fblock(tf.concat([img0, img1, d0, d1, ts], -1), 0)
     for i in range(1, 5):
-        fa = flow[:, :, :, :2]; fb = flow[:, :, :, 2:4]
+        fa = flow[..., :2]; fb = flow[..., 2:4]
         cat = tf.concat([fwarp(img0, fa), fwarp(img1, fb), fwarp(d0, fa), fwarp(d1, fb),
                          ts, mask, feat, flow], -1)
         flow, mask, feat = fblock(cat, i)
-    fa = flow[:, :, :, :2]; fb = flow[:, :, :, 2:4]
+    fa = flow[..., :2]; fb = flow[..., 2:4]
     return fwarp(img0, fa) * mask + fwarp(img1, fb) * (1 - mask)
 
 
 @tf.function(input_signature=[tf.TensorSpec([1, H, W, 7], tf.float32)])
 def fnet_stage0(x):
-    img0 = x[:, :, :, :3]; img1 = x[:, :, :, 3:6]; ts = x[:, :, :, 6:7]
+    img0 = x[..., :3]; img1 = x[..., 3:6]; ts = x[..., 6:7]
     d0 = deconv2d(conv2d(conv2d(conv2d(img0, "encode.cnn0", 2), "encode.cnn1", 1), "encode.cnn2", 1), "encode.cnn3")
     d1 = deconv2d(conv2d(conv2d(conv2d(img1, "encode.cnn0", 2), "encode.cnn1", 1), "encode.cnn2", 1), "encode.cnn3")
     flow, mask, feat = fblock(tf.concat([img0, img1, d0, d1, ts], -1), 0)
@@ -239,7 +249,7 @@ def md(a, b): return float(np.max(np.abs(a - b)))
 
 xr = np.random.RandomState(0).rand(1, H, W, 7).astype(np.float32)
 xt = torch.tensor(xr).permute(0, 3, 1, 2)
-tnet = TNet().eval(); tnet.debug = True
+tnet = TNet().eval()
 with torch.no_grad():
     ref = tnet(xt)
     dbg = {k: v.permute(0, 2, 3, 1).numpy() for k, v in tnet.dbg.items()}
