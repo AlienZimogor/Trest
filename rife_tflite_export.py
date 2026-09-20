@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """RIFE v4.26 -> LiteRT (.tflite), NHWC [1,384,512,7] -> [1,384,512,3].
 Warp = TFLite-builtin gather_nd (без grid_sample/Flex).
-ГЕЙТ: постадийный max|diff| torch vs tf (d0/d1, block0 flow/mask/feat, финал);
-конвертация только если финальный diff < 1e-3."""
+ГЕЙТ: постадийный max|diff| torch vs tf; конвертация только при diff < 1e-3.
+ Padding-семантика PyTorch воспроизведена явно:
+   conv stride=2  -> tf.pad(1) + VALID
+   conv stride=1  -> SAME (== pad1)
+   deconv k4 s2 p1-> VALID + кроп 1 с каждой стороны"""
 import os, glob
 import numpy as np
 import torch
@@ -131,12 +134,11 @@ class TNet(nn.Module):
                              ts, mask, feat, flow], 1)
             flow, mask, feat = s.b[i](cat)
         fa = flow[:, :2]; fb = flow[:, 2:4]
-        out = twarp(img0, fa) * mask + twarp(img1, fb) * (1 - mask)
-        return out
+        return twarp(img0, fa) * mask + twarp(img1, fb) * (1 - mask)
 
 
-# ---------------- TF-зеркало ----------------
-CK = {}; BK = {}; DK = {}; BV = {}
+# ---------------- TF-зеркало (TFLite-builtin) ----------------
+CK = {}; BK = {}; DK = {}
 CONV_KEYS = ["encode.cnn0", "encode.cnn1", "encode.cnn2"] + \
             ["block%d.conv0.0.0" % i for i in range(5)] + \
             ["block%d.conv0.1.0" % i for i in range(5)] + \
@@ -149,23 +151,26 @@ for pre in ["encode.cnn3"] + ["block%d.lastconv.0" % i for i in range(5)]:
     DK[pre] = tf.constant(npw(pre + ".weight").transpose(2, 3, 1, 0).astype(np.float32))
     b = npb(pre)
     BK[pre] = None if b is None else tf.constant(b)
-for i in range(5):
-    for n in range(8):
-        kp = "block%d.convblock.%d.conv" % (i, n)
-        BV[kp] = tf.constant(npw("block%d.convblock.%d.beta" % (i, n)).reshape(-1).astype(np.float32))
 
 
 def conv2d(x, pre, stride):
-    y = tf.nn.conv2d(x, CK[pre], strides=[1, stride, stride, 1], padding="SAME")
-    return y if BK[pre] is None else tf.nn.bias_add(y, BK[pre])
+    if stride == 1:
+        y = tf.nn.conv2d(x, CK[pre], strides=1, padding="SAME")
+    else:
+        xp = tf.pad(x, [[0, 0], [1, 1], [1, 1], [0, 0]])
+        y = tf.nn.conv2d(xp, CK[pre], strides=stride, padding="VALID")
+    b = BK[pre]
+    return y if b is None else y + b
 
 
 def deconv2d(x, pre):
     s = tf.shape(x)
     y = tf.nn.conv2d_transpose(x, DK[pre],
-                               output_shape=[s[0], s[1] * 2, s[2] * 2, DK[pre].shape[2]],
-                               strides=[1, 2, 2, 1], padding="SAME")
-    return y if BK[pre] is None else tf.nn.bias_add(y, BK[pre])
+                               output_shape=[s[0], s[1] * 2 + 2, s[2] * 2 + 2, DK[pre].shape[2]],
+                               strides=2, padding="VALID")
+    y = y[:, 1:-1, 1:-1, :]
+    b = BK[pre]
+    return y if b is None else y + b
 
 
 def fwarp(x, flow):
@@ -196,7 +201,8 @@ def fblock(x, i):
     y = tf.nn.relu(conv2d(y, "block%d.conv0.1.0" % i, 2))
     for n in range(8):
         cp = "block%d.convblock.%d.conv" % (i, n)
-        y = tf.nn.leaky_relu(y + conv2d(y, cp, 1) * BV[cp], 0.2)
+        y = tf.nn.leaky_relu(y + conv2d(y, cp, 1) * tf.constant(
+            npw("block%d.convblock.%d.beta" % (i, n)).reshape(-1).astype(np.float32)), 0.2)
     y = tf.nn.depth_to_space(deconv2d(y, "block%d.lastconv.0" % i), 2)
     if f > 1:
         y = tf.image.resize(y, [H, W], method="bilinear")
@@ -227,7 +233,7 @@ def fnet_stage0(x):
     return d0, d1, flow, mask, feat
 
 
-# ---------------- гейт ----------------
+# ---------------- гейт + конвертация ----------------
 def md(a, b): return float(np.max(np.abs(a - b)))
 
 
