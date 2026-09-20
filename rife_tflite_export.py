@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """RIFE v4.26 -> LiteRT (.tflite), NHWC [1,384,512,7] -> [1,384,512,3].
-Warp = gather_nd-билинейка (TFLite-builtin), без grid_sample/Flex.
-CI-гейт: постадийный max|diff| torch vs tf (block0..block4 + отдельный warp),
-конвертация только при финальном diff < 1e-3."""
+Warp = gather_nd-билинейка (TFLite-builtin), pixel_shuffle = reshape+transpose (DCR).
+CI-гейт: постадийный max|diff| torch vs tf (b0..b4 + WARP1), конвертация при diff < 1e-3."""
 import os, glob
 import numpy as np
 import torch
@@ -134,7 +133,7 @@ class TNet(nn.Module):
         return twarp(img0, fa) * mask + twarp(img1, fb) * (1 - mask)
 
 
-# ---------------- TF-зеркало ----------------
+# ---------------- TF-зеркало (TFLite-builtin) ----------------
 CK = {}; BK = {}; DK = {}; BV = {}
 for k in (["encode.cnn0", "encode.cnn1", "encode.cnn2"]
           + ["block%d.conv0.0.0" % i for i in range(5)]
@@ -174,6 +173,15 @@ def deconv2d(x, key):
     return y if b is None else y + b
 
 
+def pixel_shuffle_tf(x, r=2):
+    """PixelShuffle в DCR-порядке PyTorch (c внешний): reshape+transpose, НЕ depth_to_space."""
+    n = tf.shape(x)[0]; h = tf.shape(x)[1]; w = tf.shape(x)[2]
+    c = x.shape[3] // (r * r)
+    y = tf.reshape(x, [n, h, w, c, r, r])
+    y = tf.transpose(y, [0, 1, 4, 2, 5, 3])   # [n,h,dy,w,dx,c]
+    return tf.reshape(y, [n, h * r, w * r, c])
+
+
 def resize_tf(x, size):
     return tf.image.resize(x, size, method="bilinear")
 
@@ -207,7 +215,7 @@ def fblock(x, i):
     for n in range(8):
         cp = "block%d.convblock.%d.conv" % (i, n)
         y = tf.nn.leaky_relu(y + conv2d(y, cp, 1) * BV[cp], 0.2)
-    y = tf.nn.depth_to_space(deconv2d(y, "block%d.lastconv.0" % i), 2)
+    y = pixel_shuffle_tf(deconv2d(y, "block%d.lastconv.0" % i), 2)
     if f > 1:
         y = resize_tf(y, [H, W])
     return y[..., :4], tf.sigmoid(y[..., 4:5]), y[..., 5:13]
@@ -245,8 +253,9 @@ img0 = xi[..., :3]; img1 = xi[..., 3:6]; ts = xi[..., 6:7]
 d0 = deconv2d(conv2d(conv2d(conv2d(img0, "encode.cnn0", 2), "encode.cnn1", 1), "encode.cnn2", 1), "encode.cnn3")
 d1 = deconv2d(conv2d(conv2d(conv2d(img1, "encode.cnn0", 2), "encode.cnn1", 1), "encode.cnn2", 1), "encode.cnn3")
 tflow, tmask, tfeat = fblock(tf.concat([img0, img1, d0, d1, ts], -1), 0)
+g = dbg["b0"]
 print("STAGE b0 flow=%.6f mask=%.6f feat=%.6f"
-      % (md(tflow.numpy(), dbg["b0"][0]), md(tmask.numpy(), dbg["b0"][1]), md(tfeat.numpy(), dbg["b0"][2])))
+      % (md(tflow.numpy(), g[0]), md(tmask.numpy(), g[1]), md(tfeat.numpy(), g[2])))
 print("WARP1 diff=%.6f" % md(fwarp(img0, tflow[..., :2]).numpy(), dbg["w0"]))
 for i in range(1, 5):
     fa = tflow[..., :2]; fb = tflow[..., 2:4]
