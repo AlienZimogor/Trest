@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""RIFE v4.26 -> ONNX(opset16) -> onnx2tf -> TFLite, гейт torch-vs-tflite.
-Используем ОФИЦИАЛЬНЫЙ IFNet_HDv3.py из zip, но подменяем его warp (в zip-warplayer
-нет permute перед grid_sample) на корректный monkey-patch."""
+"""RIFE v4.26 -> LiteRT (.tflite) через АВТОРСКИЙ IFNet_HDv3.py + onnx2tf.
+Сначала синтезируем пакет model/ (warplayer/refine/loss/laplacian), ПОТОМ импорт.
+Гейт: tflite vs torch(авторский net) на одном входе, max|diff| < 1e-3."""
 import os, sys, glob, shutil, subprocess
 import numpy as np
 import torch
-import torch.nn.functional as F
+import tensorflow as tf
 
 H, W = 384, 512
 
@@ -13,11 +13,46 @@ ROOT = os.path.abspath("model_src")
 srcdir = None
 for d in [ROOT] + [p for p in glob.glob(os.path.join(ROOT, "**"), recursive=True) if os.path.isdir(p)]:
     if os.path.exists(os.path.join(d, "IFNet_HDv3.py")):
-        srcdir = d
+        srcdir = os.path.abspath(d)
         break
 assert srcdir, "IFNet_HDv3.py not found under model_src"
-sys.path.insert(0, srcdir)
 
+# ---- синтез пакета model/ ДО импорта IFNet_HDv3 ----
+pkg = os.path.join(srcdir, "model")
+os.makedirs(pkg, exist_ok=True)
+open(os.path.join(pkg, "__init__.py"), "w").close()
+
+WARP_SRC = '''
+import torch
+import torch.nn.functional as F
+
+backwarp_tenGrid = {}
+
+def warp(tenInput, tenFlow):
+    k = (str(tenFlow.device), str(tenFlow.size()))
+    if k not in backwarp_tenGrid:
+        tenHorizontal = torch.linspace(-1.0, 1.0, tenFlow.shape[3], device=tenFlow.device).view(1, 1, 1, tenFlow.shape[3]).expand(tenFlow.shape[0], -1, tenFlow.shape[2], -1)
+        tenVertical = torch.linspace(-1.0, 1.0, tenFlow.shape[2], device=tenFlow.device).view(1, 1, tenFlow.shape[2], 1).expand(tenFlow.shape[0], -1, -1, tenFlow.shape[3])
+        backwarp_tenGrid[k] = torch.cat([tenHorizontal, tenVertical], 1).to(tenFlow.device)
+    tenFlow = torch.cat([tenFlow[:, 0:1, :, :] / ((tenInput.shape[3] - 1.0) / 2.0),
+                         tenFlow[:, 1:2, :, :] / ((tenInput.shape[2] - 1.0) / 2.0)], 1)
+    return F.grid_sample(input=tenInput, grid=(backwarp_tenGrid[k] + tenFlow).permute(0, 2, 3, 1),
+                         mode='bilinear', padding_mode='zeros', align_corners=True)
+'''
+open(os.path.join(pkg, "warplayer.py"), "w").write(WARP_SRC)
+for name in ("loss.py", "laplacian.py"):
+    p = os.path.join(pkg, name)
+    if not os.path.exists(p):
+        open(p, "w").write("# stub\n")
+ref_src = os.path.join(srcdir, "refine.py")
+ref_dst = os.path.join(pkg, "refine.py")
+if os.path.exists(ref_src) and not os.path.exists(ref_dst):
+    shutil.copy(ref_src, ref_dst)
+
+sys.path.insert(0, srcdir)
+import IFNet_HDv3
+
+# ---- веса ----
 pkls = glob.glob(os.path.join(srcdir, "**", "*.pkl"), recursive=True)
 assert pkls, "pkl not found"
 raw = torch.load(pkls[0], map_location="cpu", weights_only=False)
@@ -28,28 +63,12 @@ for k, v in raw.items():
     sd[k[7:] if k.startswith("module.") else k] = v
 print("pkl keys:", len(sd))
 
-import IFNet_HDv3
-import model.warplayer as _wp
-
-def _warp(x, flow):
-    """Корректный warp (NCHW in -> NCHW out): grid + flow, permute перед grid_sample."""
-    N, C, Hh, Ww = x.size()
-    xs = torch.linspace(-1.0, 1.0, Ww, device=x.device, dtype=x.dtype).view(1, 1, 1, Ww).expand(N, -1, Hh, -1)
-    ys = torch.linspace(-1.0, 1.0, Hh, device=x.device, dtype=x.dtype).view(1, 1, Hh, 1).expand(N, -1, -1, Ww)
-    grid = torch.cat([xs, ys], 1)
-    f = torch.cat([flow[:, 0:1, :, :] / ((Ww - 1.0) / 2.0),
-                   flow[:, 1:2, :, :] / ((Hh - 1.0) / 2.0)], 1)
-    return F.grid_sample(x, (grid + f).permute(0, 2, 3, 1),
-                         mode="bilinear", padding_mode="zeros", align_corners=True)
-
-_wp.warp = _warp
-IFNet_HDv3.warp = _warp
-
 net = IFNet_HDv3.IFNet()
 missing, unexpected = net.load_state_dict(sd, strict=False)
-print("missing:", list(missing)[:10])
-print("unexpected:", list(unexpected)[:10])
-assert not missing, "state_dict missing keys -> architecture mismatch"
+missing, unexpected = list(missing), list(unexpected)
+print("missing:", missing[:10])
+print("unexpected:", unexpected[:10])
+assert not missing, "state_dict missing keys -> wrong architecture"
 net.eval()
 
 x = torch.rand(1, 7, H, W)
@@ -61,26 +80,12 @@ torch.onnx.export(net, x, "rife_v426.onnx", opset_version=16,
                   input_names=["in0"], output_names=["out0"], do_constant_folding=True)
 print("wrote rife_v426.onnx", os.path.getsize("rife_v426.onnx"))
 
-onnx_in = "rife_v426.onnx"
-try:
-    import onnx
-    from onnxsim import simplify
-    m = onnx.load(onnx_in)
-    ms, ok = simplify(m)
-    if ok:
-        onnx.save(ms, "rife_v426_sim.onnx")
-        onnx_in = "rife_v426_sim.onnx"
-        print("onnxsim ok ->", onnx_in)
-except Exception as e:
-    print("onnxsim skip:", e)
-
-subprocess.run(["onnx2tf", "-i", onnx_in, "-o", "tfl_out", "-b", "1"], check=True)
+subprocess.run(["onnx2tf", "-i", "rife_v426.onnx", "-o", "tfl_out", "-b", "1"], check=True)
 cand = sorted(glob.glob("tfl_out/*_float32.tflite"))
 assert cand, "no float32 tflite produced"
 f32 = cand[0]
 print("onnx2tf produced:", f32)
 
-import tensorflow as tf
 interp = tf.lite.Interpreter(model_path=f32)
 interp.allocate_tensors()
 di = interp.get_input_details()[0]; do = interp.get_output_details()[0]
