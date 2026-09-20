@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """RIFE v4.26 -> LiteRT (.tflite) через ОРИГИНАЛЬНЫЙ IFNet_HDv3.py из zip.
-Синтезируем пакет model/ (warplayer с broadcast-Add вместо repeat/Expand,
-refine копируем, loss/laplacian — пустые стабы), чтобы импорт прошёл и
-onnx2tf не падал на узле Expand.
+- Синтезируем пакет model/ (warplayer с broadcast-Add вместо repeat/Expand,
+  refine копируем, loss/laplacian — пустые стабы), чтобы импорт прошёл и
+  onnx2tf не падал на узле Expand.
+- teacher.* ключи pkl игнорируем (strict=False): это distillation-teacher,
+  которого в инференс-сети нет.
+- forward вызываем через probe стилей вызова (scale_list=[16,8,4,2,1] и т.п.),
+  чтобы не словить IndexError на scale_list[i].
 Пайплайн: pkl -> IFNet_HDv3.IFNet -> ONNX(opset16) -> onnx2tf -> tflite.
 Гейт: tflite vs оригинальный PyTorch на том же входе, max|diff| < 1e-3."""
-import os, sys, glob, shutil, subprocess, importlib.util
+import os, sys, glob, shutil, subprocess
 import numpy as np
 import torch
 import torch.nn as nn
@@ -46,7 +50,6 @@ def warp(x, flow):
 with open(os.path.join(stub, "warplayer.py"), "w") as f:
     f.write(WARPLAYER_SRC)
 
-# refine копируем из верхнего уровня zip (если есть), иначе пустой стаб
 refine_dst = os.path.join(stub, "refine.py")
 refine_src = os.path.join(srcdir, "refine.py")
 if os.path.exists(refine_src):
@@ -54,7 +57,6 @@ if os.path.exists(refine_src):
 elif not os.path.exists(refine_dst):
     open(refine_dst, "w").close()
 
-# пустые стабы для прочих model.*, которые может импортировать IFNet
 for name in ("loss.py", "laplacian.py"):
     p = os.path.join(stub, name)
     if not os.path.exists(p):
@@ -81,24 +83,51 @@ print("missing:", missing[:10], "unexpected:", unexpected[:10])
 assert not missing, "state_dict не лёг строго: несовпадение архитектуры"
 model.eval()
 
-class Wrap7(nn.Module):
-    """Вход [1,7,H,W] = (img0,img1,timestep). Пробуем родной forward; если он
-    ждёт timestep отдельным аргументом — передаём его из 7-го канала."""
-    def __init__(self, net):
-        super().__init__()
-        self.net = net
-    def forward(self, x):
-        try:
-            return self.net(x)
-        except TypeError:
-            return self.net(x[:, :6], timestep=x[:, 6:7])
+# ---------- probe стилей вызова forward (scale_list coarse->fine) ----------
+SCALES = [16, 8, 4, 2, 1]
+styles = [
+    ("scale_list", lambda x: model(x, scale_list=SCALES)),
+    ("ts+scale_list", lambda x: model(x, 0.5, SCALES)),
+    ("scale", lambda x: model(x, scale=1.0)),
+    ("ts", lambda x: model(x, 0.5)),
+    ("bare", lambda x: model(x)),
+]
 
-wrap = Wrap7(model)
+def _pick_tensor(o):
+    if torch.is_tensor(o):
+        return o
+    if isinstance(o, (list, tuple)):
+        for t in reversed(o):
+            if torch.is_tensor(t):
+                return t
+    return None
+
+chosen_name, chosen_fn = None, None
+with torch.no_grad():
+    for name, fn in styles:
+        try:
+            t = _pick_tensor(fn(torch.rand(1, 7, H, W)))
+            if t is not None and t.dim() == 4 and (t.shape[1] == 3 or t.shape[-1] == 3):
+                chosen_name, chosen_fn = name, fn
+                break
+        except Exception:
+            continue
+assert chosen_fn, "не подошёл ни один стиль вызова forward"
+print("forward style:", chosen_name)
+
+class Wrap7(nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+    def forward(self, x):
+        return self.fn(x)
+
+wrap = Wrap7(chosen_fn)
 
 # ---------- эталон ----------
 x = torch.rand(1, 7, H, W)
 with torch.no_grad():
-    ref = wrap(x).numpy()
+    ref = _pick_tensor(wrap(x)).numpy()
 print("torch ref mean=%.4f min=%.4f max=%.4f" % (ref.mean(), ref.min(), ref.max()))
 
 # ---------- ONNX ----------
@@ -134,7 +163,9 @@ xin = x.numpy().transpose(0, 2, 3, 1).astype(np.float32)
 interp.set_tensor(din["index"], xin)
 interp.invoke()
 got = interp.get_tensor(dout["index"]).astype(np.float32)
-refn = ref.transpose(0, 2, 3, 1)
+if got.ndim == 4 and got.shape[1] == 3:
+    got = got.transpose(0, 2, 3, 1)
+refn = ref.transpose(0, 2, 3, 1) if (ref.ndim == 4 and ref.shape[1] == 3) else ref
 diff = float(np.max(np.abs(got - refn)))
 print("GATE max|diff| = %.6f" % diff)
 assert diff < 1e-3, "torch/tflite mismatch too large"
