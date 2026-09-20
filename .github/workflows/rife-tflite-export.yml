@@ -13,7 +13,7 @@ jobs:
           python -m pip install -q --upgrade pip
           python -m pip install -q numpy
           python -m pip install -q torch==2.6.0+cpu --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install -q tensorflow==2.17.0
+          python -m pip install -q tensorflow==2.16.1
       - name: download release zip
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
