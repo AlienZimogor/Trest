@@ -184,4 +184,8 @@ print("GATE max|diff| = %.6f" % diff)
 assert diff < 1e-3, "torch/tflite mismatch too large"
 
 shutil.copy(src, "rife_v426.tflite")
+f16 = "tfl_out/rife_v426_sim_float16.tflite"
+if os.path.exists(f16):
+    shutil.copy(f16, "rife_v426_f16.tflite")
+    print("wrote rife_v426_f16.tflite %d B" % os.path.getsize("rife_v426_f16.tflite"))
 print("wrote rife_v426.tflite %d B" % os.path.getsize("rife_v426.tflite"))
