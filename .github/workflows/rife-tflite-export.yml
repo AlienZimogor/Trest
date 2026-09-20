@@ -13,16 +13,22 @@ jobs:
       - name: deps
         run: |
           python -m pip install -q --upgrade pip
-          # TF 2.16 собран против NumPy 1.x и protobuf 4.x — пиним ДО установки TF
           python -m pip install -q "numpy==1.26.4" "protobuf==4.25.3"
           python -m pip install -q torch==2.6.0+cpu --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -q tensorflow==2.16.1
-          # полный набор скрытых зависимостей onnx2tf
           python -m pip install -q tf-keras==2.16.0 psutil ai-edge-litert sng4onnx onnxruntime
           python -m pip install -q onnx==1.16.2 onnx_graphsurgeon onnx2tf
-          # финальный контроль: никто не должен был поднять numpy/protobuf
+          # onnxsim (CLI + python) — сворачивает Expand/meshgrid/broadcasting,
+          # без него onnx2tf падает на Expand с Keras-Functional ValueError
+          python -m pip install -q onnxsim
           python -m pip install -q --force-reinstall --no-deps "numpy==1.26.4" "protobuf==4.25.3"
-          python -c "import numpy, google.protobuf, tensorflow as tf, tf_keras, psutil, ai_edge_litert, sng4onnx, onnx, onnx_graphsurgeon, onnx2tf; print('numpy', numpy.__version__); print('protobuf', google.protobuf.__version__); print('tf', tf.__version__); print('tf_keras', tf_keras.__version__); print('onnx2tf stack ok')"
+          python -c "import numpy, google.protobuf, tensorflow as tf, tf_keras, psutil, ai_edge_litert, sng4onnx, onnx, onnx_graphsurgeon, onnx2tf, onnxsim; \
+                     print('numpy', numpy.__version__); \
+                     print('protobuf', google.protobuf.__version__); \
+                     print('tf', tf.__version__); \
+                     print('tf_keras', tf_keras.__version__); \
+                     print('onnxsim', onnxsim.__version__); \
+                     print('stack ok')"
 
       - name: download release zip
         env:
