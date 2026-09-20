@@ -17,13 +17,18 @@ jobs:
           python -m pip install -q "numpy==1.26.4" "protobuf==4.25.3"
           python -m pip install -q torch==2.6.0+cpu --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -q tensorflow==2.16.1
-          # скрытые импорты onnx2tf: tf_keras (Keras3-совместимость), psutil, ai_edge_litert (LiteRT-рантайм)
-          python -m pip install -q tf-keras==2.16.0 psutil ai-edge-litert
+          # ПОЛНЫЙ набор скрытых зависимостей onnx2tf (всплывали по одной):
+          #   tf_keras   — Keras3-совместимость при TF>=2.16
+          #   psutil     — common_functions
+          #   ai-edge-litert — LiteRT-рантайм (ai_edge_litert.interpreter)
+          #   sng4onnx   — авто-генерация имён операций (onnx2tf.py:63)
+          #   onnxruntime — используется отдельными флагами конвертера
+          python -m pip install -q tf-keras==2.16.0 psutil ai-edge-litert sng4onnx onnxruntime
           python -m pip install -q onnx==1.16.2 onnx_graphsurgeon onnx2tf
           # финальный контроль: никто не должен был поднять numpy/protobuf
           python -m pip install -q --force-reinstall --no-deps "numpy==1.26.4" "protobuf==4.25.3"
-          # проверка ВСЕГО стека onnx2tf ДО экспорта: любые скрытые модули упадут здесь
-          python -c "import numpy, google.protobuf, tensorflow as tf, tf_keras, psutil, ai_edge_litert, onnx, onnx_graphsurgeon, onnx2tf; \
+          # проверка ВСЕГО стека onnx2tf ДО экспорта
+          python -c "import numpy, google.protobuf, tensorflow as tf, tf_keras, psutil, ai_edge_litert, sng4onnx, onnx, onnx_graphsurgeon, onnx2tf; \
                      print('numpy', numpy.__version__); \
                      print('protobuf', google.protobuf.__version__); \
                      print('tf', tf.__version__); \
