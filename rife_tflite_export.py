@@ -69,6 +69,9 @@ def twarp(x, flow):
     gy, gx = torch.meshgrid(ys, xs, indexing="ij")
     base = torch.stack([gx, gy], -1).unsqueeze(0)
     vg = base + flow.permute(0, 2, 3, 1)
+    # grid_sample(align_corners=True) ждёт НОРМИРОВАННЫЙ grid [-1,1]
+    vg = torch.stack([2.0 * vg[..., 0] / (WW - 1) - 1.0,
+                      2.0 * vg[..., 1] / (HH - 1) - 1.0], -1)
     return F.grid_sample(x, vg, align_corners=True, padding_mode="zeros")
 
 
@@ -101,7 +104,8 @@ class TBlock(nn.Module):
         for cb in s.cb: y = cb(y)
         y = s.ps(s.last(y))
         if s.f > 1:
-            y = F.interpolate(y, scale_factor=float(s.f), mode="bilinear", align_corners=False)
+            x2 = F.interpolate(y, scale_factor=float(s.f), mode="bilinear", align_corners=False)
+            y = x2
         return y[:, :4], torch.sigmoid(y[:, 4:5]), y[:, 5:13]
 
 
@@ -188,7 +192,9 @@ def fwarp(x, flow):
 def fblock(x, i):
     f = FACT[i]
     if f > 1:
-        x = tf.image.resize(x, [H // f, W // f], method="bilinear", align_corners=False)
+        # TF2 tf.image.resize НЕ принимает align_corners; дефолт bilinear
+        # (half-pixel centers) == PyTorch align_corners=False, что и нужно RIFE.
+        x = tf.image.resize(x, [H // f, W // f], method="bilinear")
     y = tf.nn.relu(conv2d(x, "block%d.conv0.0.0" % i, 2))
     y = tf.nn.relu(conv2d(y, "block%d.conv0.1.0" % i, 2))
     for n in range(8):
@@ -196,7 +202,7 @@ def fblock(x, i):
         y = tf.nn.leaky_relu(y + conv2d(y, cp, 1) * BV[cp], 0.2)
     y = tf.nn.depth_to_space(deconv2d(y, "block%d.lastconv.0" % i), 2)
     if f > 1:
-        y = tf.image.resize(y, [H, W], method="bilinear", align_corners=False)
+        y = tf.image.resize(y, [H, W], method="bilinear")
     return y[:, :, :, :4], tf.sigmoid(y[:, :, :, 4:5]), y[:, :, :, 5:13]
 
 
