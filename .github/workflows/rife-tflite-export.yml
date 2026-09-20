@@ -14,10 +14,10 @@ jobs:
           python -m pip install -q "numpy==1.26.4" "protobuf==4.25.3"
           python -m pip install -q torch==2.6.0+cpu --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -q tensorflow==2.16.1
-          python -m pip install -q tf-keras==2.16.0 psutil ai-edge-litert sng4onnx onnxruntime
+          python -m pip install -q tf-keras==2.16.0 psutil ai-edge-litert sng4onnx onnxruntime onnxsim
           python -m pip install -q onnx==1.16.2 onnx_graphsurgeon onnx2tf
           python -m pip install -q --force-reinstall --no-deps "numpy==1.26.4" "protobuf==4.25.3"
-          python -c "import numpy, google.protobuf, tensorflow as tf, tf_keras, psutil, ai_edge_litert, sng4onnx, onnx, onnx_graphsurgeon, onnx2tf; print('stack ok')"
+          python -c "import numpy, google.protobuf, tensorflow as tf, tf_keras, psutil, ai_edge_litert, sng4onnx, onnxsim, onnx, onnx_graphsurgeon, onnx2tf; print('stack ok')"
       - name: download release zip
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -33,7 +33,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: rife-tflite
-          path: |
-            rife_v426.tflite
-            rife_v426_f16.tflite
+          path: rife_v426*.tflite
           if-no-files-found: error
