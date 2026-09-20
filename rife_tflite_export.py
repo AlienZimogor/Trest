@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """RIFE v4.26 -> LiteRT (.tflite), NHWC [1,384,512,7] -> [1,384,512,3].
-Warp = gather_nd-билинейка (TFLite-builtin), pixel_shuffle = reshape+transpose (DCR).
-CI-гейт: постадийный max|diff| torch vs tf; конвертация только при diff < 1e-3."""
+Warp собран из TFLite-builtin ops (gather_nd), без grid_sample/Flex.
+CI-гейт: сравнение с PyTorch-эталоном (max|diff| < 1e-3) до конвертации."""
 import os, glob
 import numpy as np
 import torch
@@ -181,7 +181,9 @@ def pixel_shuffle_tf(x, r=2):
 
 
 def resize_tf(x, size):
-    return tf.image.resize(x, size, method="bilinear", align_corners=False)
+    # TF2 tf.image.resize bilinear по умолчанию = half-pixel centers
+    # = PyTorch align_corners=False. Kwarg align_corners в TF2 отсутствует.
+    return tf.image.resize(x, size, method="bilinear")
 
 
 def fwarp(x, flow):
