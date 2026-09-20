@@ -1,18 +1,13 @@
 name: rife-tflite-export
-
-on:
-  workflow_dispatch:
-
+on: [workflow_dispatch]
 jobs:
   export:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: deps
         run: |
           python -m pip install -q --upgrade pip
@@ -20,9 +15,9 @@ jobs:
           python -m pip install -q torch==2.6.0+cpu --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -q tensorflow==2.16.1
           python -m pip install -q tf-keras==2.16.0 psutil ai-edge-litert sng4onnx onnxruntime
-          python -m pip install -q onnx==1.16.2 onnx_graphsurgeon onnx2tf onnxsim
+          python -m pip install -q onnx==1.16.2 onnx_graphsurgeon onnx2tf
           python -m pip install -q --force-reinstall --no-deps "numpy==1.26.4" "protobuf==4.25.3"
-
+          python -c "import numpy, google.protobuf, tensorflow as tf, tf_keras, psutil, ai_edge_litert, sng4onnx, onnx, onnx_graphsurgeon, onnx2tf; print('stack ok')"
       - name: download release zip
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -33,10 +28,8 @@ jobs:
           if [ -z "$URL" ]; then echo "NO ZIP ASSET"; exit 1; fi
           curl -sL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" "$URL" -o model.zip
           unzip -o model.zip -d model_src
-
       - name: export
         run: python -u rife_tflite_export.py
-
       - uses: actions/upload-artifact@v4
         with:
           name: rife-tflite
